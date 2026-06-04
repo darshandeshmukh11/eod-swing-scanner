@@ -8,11 +8,19 @@ modules required at import time.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from datetime import datetime, time
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
 import yfinance as yf
+
+IST = ZoneInfo("Asia/Kolkata")
+NSE_MARKET_OPEN = time(9, 15)
+NSE_MARKET_CLOSE = time(15, 30)
 
 _OHLCV_COLS = ("Open", "High", "Low", "Close", "Volume")
 
@@ -262,6 +270,160 @@ def download_daily_single(yahoo_ticker: str, period: str) -> pd.DataFrame:
     return _trim_ohlcv(df).dropna()
 
 
+@dataclass
+class LiveQuote:
+    price: float
+    source: str
+
+
+def _pick_positive(*values: object) -> Optional[float]:
+    for v in values:
+        if v is None:
+            continue
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            continue
+        if f > 0:
+            return f
+    return None
+
+
+def fetch_live_quote(symbol: str) -> Optional[LiveQuote]:
+    """Latest NSE LTP via Yahoo (fast_info → info → 1m fallback)."""
+    yahoo_sym = to_yahoo_nse(symbol)
+    try:
+        ticker = yf.Ticker(yahoo_sym)
+        try:
+            fi = ticker.fast_info
+            last = _pick_positive(
+                getattr(fi, "last_price", None),
+                getattr(fi, "lastPrice", None),
+                fi.get("last_price") if hasattr(fi, "get") else None,
+            )
+            if last is not None:
+                return LiveQuote(last, f"Yahoo live ({yahoo_sym})")
+        except Exception:
+            pass
+        try:
+            info = ticker.info or {}
+            last = _pick_positive(
+                info.get("regularMarketPrice"),
+                info.get("currentPrice"),
+                info.get("postMarketPrice"),
+                info.get("preMarketPrice"),
+            )
+            if last is not None:
+                return LiveQuote(last, f"Yahoo quote ({yahoo_sym})")
+        except Exception:
+            pass
+        hist = ticker.history(period="1d", interval="1m", prepost=False)
+        if hist is not None and not hist.empty and "Close" in hist.columns:
+            closes = hist["Close"].dropna()
+            if not closes.empty:
+                return LiveQuote(float(closes.iloc[-1]), f"Yahoo 1m ({yahoo_sym})")
+    except Exception:
+        return None
+    return None
+
+
+def fetch_live_quotes_batch(
+    symbols: list[str],
+    *,
+    max_workers: int = 8,
+) -> dict[str, LiveQuote]:
+    """Parallel live quotes keyed by NSE symbol."""
+    if not symbols:
+        return {}
+    workers = min(max_workers, len(symbols))
+    out: dict[str, LiveQuote] = {}
+
+    def _one(sym: str) -> tuple[str, Optional[LiveQuote]]:
+        return sym, fetch_live_quote(sym)
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(_one, s) for s in symbols]
+        for fut in as_completed(futures):
+            sym, quote = fut.result()
+            if quote is not None:
+                out[sym] = quote
+    return out
+
+
+def ist_now() -> datetime:
+    return datetime.now(IST)
+
+
+def market_session_status(now: Optional[datetime] = None) -> dict[str, object]:
+    """NSE cash session state for UI (IST)."""
+    now = now or ist_now()
+    wd = now.weekday()
+    t = now.time()
+    if wd >= 5:
+        phase = "weekend"
+        is_open = False
+    elif t < NSE_MARKET_OPEN:
+        phase = "pre_market"
+        is_open = False
+    elif t <= NSE_MARKET_CLOSE:
+        phase = "market_open"
+        is_open = True
+    else:
+        phase = "post_market"
+        is_open = False
+    return {
+        "is_open": is_open,
+        "phase": phase,
+        "as_of": now.strftime("%Y-%m-%d %H:%M IST"),
+    }
+
+
+def normalize_daily_index(df: pd.DataFrame) -> pd.DataFrame:
+    """Daily bars indexed by IST calendar date (naive midnight)."""
+    if df.empty:
+        return df
+    out = df.copy()
+    idx = pd.to_datetime(out.index)
+    if getattr(idx, "tz", None) is not None:
+        idx = idx.tz_convert(IST)
+    else:
+        idx = idx.tz_localize(IST)
+    out.index = idx.normalize().tz_localize(None)
+    return out.sort_index()
+
+
+def merge_realtime_session(df: pd.DataFrame, live_price: float) -> pd.DataFrame:
+    """Patch today's daily bar with live LTP (H/L/C) for intraday scanning."""
+    out = normalize_daily_index(df)
+    if out.empty:
+        return out
+    live_price = float(live_price)
+    today_ts = pd.Timestamp(ist_now().date())
+
+    if out.index[-1] >= today_ts:
+        o = float(out["Open"].iloc[-1])
+        h = max(float(out["High"].iloc[-1]), live_price)
+        low = min(float(out["Low"].iloc[-1]), live_price)
+        vol = float(out["Volume"].iloc[-1]) if "Volume" in out.columns else 0.0
+        out.iloc[-1, out.columns.get_loc("Open")] = o
+        out.iloc[-1, out.columns.get_loc("High")] = h
+        out.iloc[-1, out.columns.get_loc("Low")] = low
+        out.iloc[-1, out.columns.get_loc("Close")] = live_price
+        if "Volume" in out.columns:
+            out.iloc[-1, out.columns.get_loc("Volume")] = vol
+    else:
+        prev_close = float(out["Close"].iloc[-1])
+        row = {
+            "Open": prev_close,
+            "High": max(prev_close, live_price),
+            "Low": min(prev_close, live_price),
+            "Close": live_price,
+            "Volume": 0.0,
+        }
+        out.loc[today_ts] = row
+    return out
+
+
 def compute_ema(close: pd.Series, period: int) -> pd.Series:
     return close.astype(float).ewm(span=period, adjust=False).mean()
 
@@ -357,14 +519,17 @@ def _last_completed_bar_idx(df: pd.DataFrame) -> int:
     if len(df) < 2:
         return -1
     last_ts = pd.Timestamp(df.index[-1])
-    if last_ts.tz is not None:
-        last_ts = last_ts.tz_convert("Asia/Kolkata")
-    else:
-        last_ts = last_ts.tz_localize("Asia/Kolkata")
-    today = pd.Timestamp.now(tz="Asia/Kolkata").normalize()
+    today = pd.Timestamp(ist_now().date())
     if last_ts.normalize() >= today:
         return -2
     return -1
+
+
+def scan_bar_idx(df: pd.DataFrame, *, realtime: bool) -> int:
+    """Bar index for filters: last completed day (EOD) or today with live LTP (realtime)."""
+    if realtime:
+        return len(df) - 1
+    return _last_completed_bar_idx(df)
 
 
 # --- Candlestick patterns -----------------------------------------------------
