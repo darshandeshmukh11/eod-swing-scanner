@@ -44,7 +44,8 @@ from eod_swing_lib import (
     get_nifty50_symbols,
     infer_support_resistance,
     merge_realtime_session,
-    scan_bar_idx,
+    normalize_daily_index,
+    session_bar_indices,
     to_yahoo_nse,
 )
 
@@ -179,34 +180,41 @@ def evaluate_symbol(
     if len(df) < cfg.min_history_bars:
         return None
 
-    work = df
+    work = normalize_daily_index(df)
     live_ltp: Optional[float] = None
     live_source = ""
-    if cfg.use_realtime and live_quote is not None:
-        work = merge_realtime_session(df, live_quote.price)
-        live_ltp = live_quote.price
-        live_source = live_quote.source
+    if cfg.use_realtime:
+        if live_quote is not None:
+            work = merge_realtime_session(work, live_quote.price)
+            live_ltp = live_quote.price
+            live_source = live_quote.source
+        elif len(work) > 0:
+            live_ltp = float(work["Close"].iloc[-1])
 
-    idx = scan_bar_idx(work, realtime=cfg.use_realtime)
-    if idx < 0 or idx >= len(work):
+    price_idx, volume_idx, today_developing = session_bar_indices(
+        work,
+        realtime=cfg.use_realtime,
+        volume_ma_period=cfg.volume_ma_period,
+    )
+    if price_idx < 0 or price_idx >= len(work):
         return None
 
     close_s = work["Close"].astype(float)
-    price = float(close_s.iloc[idx])
-    prior_close = float(close_s.iloc[idx - 1]) if idx > 0 else price
-    ema20 = float(compute_ema(close_s, cfg.ema_fast).iloc[idx])
-    ema50 = float(compute_ema(close_s, cfg.ema_slow).iloc[idx])
+    price = float(live_ltp) if live_ltp is not None else float(close_s.iloc[price_idx])
+    prior_close = float(close_s.iloc[price_idx - 1]) if price_idx > 0 else price
+    ema20 = float(compute_ema(close_s, cfg.ema_fast).iloc[price_idx])
+    ema50 = float(compute_ema(close_s, cfg.ema_slow).iloc[price_idx])
 
     if not (price > ema20 > ema50):
         return None
 
-    rsi = float(compute_rsi(close_s, cfg.rsi_period).iloc[idx])
+    rsi = float(compute_rsi(close_s, cfg.rsi_period).iloc[price_idx])
     if rsi <= cfg.min_rsi:
         return None
 
     vol = work["Volume"].astype(float)
-    avg_vol = float(vol.rolling(cfg.volume_ma_period).mean().iloc[idx])
-    last_vol = float(vol.iloc[idx])
+    avg_vol = float(vol.rolling(cfg.volume_ma_period).mean().iloc[volume_idx])
+    last_vol = float(vol.iloc[volume_idx])
     if avg_vol <= 0 or last_vol <= avg_vol:
         return None
 
@@ -217,12 +225,13 @@ def evaluate_symbol(
     near_ema = dist_ema_pct <= cfg.near_ema_pct
     near_support = dist_support_pct <= cfg.near_support_pct
 
-    prev_close = float(close_s.iloc[idx - 1]) if idx > 0 else price
+    prev_close = float(close_s.iloc[price_idx - 1]) if price_idx > 0 else price
     breakout = price > resistance * (1.0 + cfg.breakout_buffer_pct / 100.0) and prev_close <= resistance
 
-    patterns = detect_patterns_at_idx(work, idx)
+    pattern_idx = volume_idx if today_developing else price_idx
+    patterns = detect_patterns_at_idx(work, pattern_idx)
     vol_vs_avg = (last_vol - avg_vol) / avg_vol * 100.0 if avg_vol > 0 else 0.0
-    bar_date = pd.Timestamp(work.index[idx]).strftime("%Y-%m-%d")
+    bar_date = pd.Timestamp(work.index[price_idx]).strftime("%Y-%m-%d")
     if cfg.use_realtime and live_ltp is not None:
         as_of = f"{bar_date} (live)"
         session_mode = "realtime"
@@ -230,7 +239,7 @@ def evaluate_symbol(
         as_of = bar_date
         session_mode = "eod"
 
-    pivot, s1, s2, r1, r2 = immediate_floor_pivots(work, idx)
+    pivot, s1, s2, r1, r2 = immediate_floor_pivots(work, price_idx)
 
     return ScanHit(
         symbol=symbol,

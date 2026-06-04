@@ -514,22 +514,75 @@ def infer_support_resistance(
     return nearest_support, nearest_resistance, atr_value
 
 
+def _today_ts() -> pd.Timestamp:
+    return pd.Timestamp(ist_now().date())
+
+
+def has_today_bar(df: pd.DataFrame) -> bool:
+    if df.empty:
+        return False
+    return pd.Timestamp(df.index[-1]) >= _today_ts()
+
+
+def today_session_is_developing(
+    df: pd.DataFrame,
+    volume_ma_period: int = 20,
+) -> bool:
+    """True when the latest row is today but session volume is not complete yet."""
+    if not has_today_bar(df):
+        return False
+    if market_session_status()["is_open"]:
+        return True
+    vol = df["Volume"].astype(float)
+    last_vol = float(vol.iloc[-1])
+    avg_vol = float(vol.rolling(volume_ma_period).mean().iloc[-1])
+    if avg_vol <= 0:
+        return last_vol <= 0
+    return last_vol < avg_vol * 0.25
+
+
 def _last_completed_bar_idx(df: pd.DataFrame) -> int:
     """Use prior session when the latest row is still today's incomplete daily bar."""
     if len(df) < 2:
         return -1
     last_ts = pd.Timestamp(df.index[-1])
-    today = pd.Timestamp(ist_now().date())
-    if last_ts.normalize() >= today:
+    if last_ts >= _today_ts():
         return -2
     return -1
 
 
+def session_bar_indices(
+    df: pd.DataFrame,
+    *,
+    realtime: bool,
+    volume_ma_period: int = 20,
+) -> tuple[int, int, bool]:
+    """
+    Return (price_idx, volume_idx, today_developing).
+
+    EOD: last completed session for all metrics.
+    Realtime: live price on latest bar; volume on prior session until today
+    has full session volume (fixes pre-market / intraday false negatives).
+    """
+    if df.empty:
+        return -1, -1, False
+
+    developing = realtime and today_session_is_developing(df, volume_ma_period)
+    n = len(df)
+
+    if not realtime:
+        idx = _last_completed_bar_idx(df)
+        return idx, idx, developing
+
+    price_idx = n - 1
+    volume_idx = n - 2 if developing and n >= 2 else n - 1
+    return price_idx, volume_idx, developing
+
+
 def scan_bar_idx(df: pd.DataFrame, *, realtime: bool) -> int:
-    """Bar index for filters: last completed day (EOD) or today with live LTP (realtime)."""
-    if realtime:
-        return len(df) - 1
-    return _last_completed_bar_idx(df)
+    """Bar index for price-oriented metrics (see session_bar_indices for volume)."""
+    price_idx, _, _ = session_bar_indices(df, realtime=realtime)
+    return price_idx
 
 
 # --- Candlestick patterns -----------------------------------------------------

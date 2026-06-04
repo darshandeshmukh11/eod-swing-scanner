@@ -24,7 +24,7 @@ streamlit run eod_swing_app.py
 
 | Mode | When to use |
 |------|-------------|
-| **Realtime** (default in app) | During NSE hours — today's bar + live LTP for RSI, volume, and **next-session** pivots (S1/S2/R1/R2). |
+| **Realtime** (default in app) | Live LTP for trend, RSI, and **next-session** pivots. Volume filter uses the **last completed session** until today's volume is meaningful (avoids pre-market / intraday false negatives). |
 | **EOD** | After close or Telegram cron — last **completed** daily bar only. |
 
 In the app: enable **Realtime (live LTP)**, run **Run full scan** once, then **Refresh live LTP** or turn on **Auto-refresh** (default 90s).

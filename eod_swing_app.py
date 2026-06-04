@@ -686,11 +686,13 @@ def _market_banner(cfg: ScannerConfig) -> None:
     phase = str(status["phase"]).replace("_", " ")
     if status["is_open"] and cfg.use_realtime:
         st.success(
-            f"**NSE open** · {status['as_of']} · Realtime scan uses live LTP on today's session."
+            f"**NSE open** · {status['as_of']} · Live LTP for trend/RSI/pivots; "
+            f"volume filter uses the **last completed session** until today's volume is in."
         )
     elif cfg.use_realtime:
         st.info(
-            f"**NSE {phase}** · {status['as_of']} · Live LTP still updates; pivots use latest session bar."
+            f"**NSE {phase}** · {status['as_of']} · Live LTP on latest bar; "
+            f"volume uses prior session if today's bar is still empty (pre-market)."
         )
     else:
         st.caption(f"**EOD mode** · {status['as_of']} · Using last completed daily bar only.")
