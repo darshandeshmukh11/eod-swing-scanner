@@ -12,7 +12,6 @@ Run:
 from __future__ import annotations
 
 import io
-from datetime import datetime, timedelta
 from typing import Any, Optional
 
 import pandas as pd
@@ -20,21 +19,8 @@ import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
 
-from eod_swing_lib import (
-    compute_ema,
-    download_daily_single,
-    fetch_live_quote,
-    market_session_status,
-    merge_realtime_session,
-    normalize_daily_index,
-    to_yahoo_nse,
-)
-from eod_swing_scanner import (
-    ScannerConfig,
-    hits_to_dataframe,
-    refresh_hits_live,
-    run_eod_swing_scan,
-)
+from eod_swing_lib import compute_ema, download_daily_single, to_yahoo_nse
+from eod_swing_scanner import ScannerConfig, hits_to_dataframe, run_eod_swing_scan
 
 st.set_page_config(
     page_title="EOD Swing Scanner",
@@ -45,8 +31,7 @@ st.set_page_config(
 
 PIVOT_NOTE = (
     "Floor pivots from the **scanned session** high / low / close — levels for the "
-    "**next** session. **Realtime mode** uses **live LTP** on today's bar during market hours "
-    "so you can plan tomorrow's trade before the close. **Buy zone** = scale-in · **Sell zone** = targets. "
+    "**next** session. **Buy zone** = scale-in area · **Sell zone** = target trim area. "
     "Use **S1 / S2** for stop-loss."
 )
 
@@ -77,38 +62,27 @@ def _inject_dark_theme() -> None:
     )
 
 
-def _sidebar_config() -> tuple[ScannerConfig, int, bool]:
+def _sidebar_config() -> ScannerConfig:
     st.sidebar.header("Scanner filters")
     st.sidebar.caption("All three core filters must pass: trend · volume · RSI")
 
-    use_realtime = st.sidebar.checkbox(
-        "Realtime (live LTP)",
-        value=True,
-        help="During market hours: today's bar + live price for RSI, volume, pivots for next session.",
-    )
     nifty50_only = st.sidebar.checkbox("NIFTY 50 only", value=False)
     prefer_live = st.sidebar.checkbox("Live symbol list (Wikipedia)", value=True)
     period = st.sidebar.selectbox("Price history", ["6mo", "1y", "2y"], index=1)
-
-    st.sidebar.subheader("Live refresh")
-    auto_refresh = st.sidebar.checkbox("Auto-refresh live quotes", value=True)
-    refresh_sec = st.sidebar.slider("Refresh interval (sec)", 60, 300, 90, 15)
 
     st.sidebar.subheader("Thresholds")
     min_rsi = st.sidebar.slider("Min RSI(14)", 50, 75, 55)
     near_ema_pct = st.sidebar.slider("Near 20 EMA (%)", 0.5, 5.0, 2.0, 0.25)
     near_support_pct = st.sidebar.slider("Near support (%)", 1.0, 8.0, 3.5, 0.25)
 
-    cfg = ScannerConfig(
+    return ScannerConfig(
         period=period,
         min_rsi=float(min_rsi),
         near_ema_pct=float(near_ema_pct),
         near_support_pct=float(near_support_pct),
         prefer_live_symbols=prefer_live,
         nifty50_only=nifty50_only,
-        use_realtime=use_realtime,
     )
-    return cfg, int(refresh_sec), auto_refresh
 
 
 def _prepare_display_df(raw: pd.DataFrame) -> pd.DataFrame:
@@ -137,16 +111,6 @@ def _prepare_display_df(raw: pd.DataFrame) -> pd.DataFrame:
     out["Near EMA"] = out["near_ema"].map({True: "Yes", False: "—"})
     out["Near Support"] = out["near_support"].map({True: "Yes", False: "—"})
     out["Breakout"] = out["breakout_resistance"].map({True: "Yes", False: "—"})
-    if "live_ltp" in out.columns:
-        out["Live LTP"] = out["live_ltp"]
-        out["LTP vs prior"] = out.apply(
-            lambda r: (
-                f"{(float(r['live_ltp']) - float(r['prior_close'])) / float(r['prior_close']) * 100:+.2f}%"
-                if pd.notna(r.get("live_ltp")) and pd.notna(r.get("prior_close")) and r["prior_close"]
-                else "—"
-            ),
-            axis=1,
-        )
 
     return out.rename(
         columns={
@@ -154,7 +118,6 @@ def _prepare_display_df(raw: pd.DataFrame) -> pd.DataFrame:
             "universe": "Universe",
             "as_of": "As of",
             "close": "Close",
-            "session_mode": "Mode",
             "pivot": "Pivot",
             "rsi": "RSI",
             "vol_vs_avg_pct": "Vol vs avg %",
@@ -168,10 +131,7 @@ def _prepare_display_df(raw: pd.DataFrame) -> pd.DataFrame:
 DISPLAY_COLS = [
     "Symbol",
     "Universe",
-    "Mode",
     "Close",
-    "Live LTP",
-    "LTP vs prior",
     "Suggested entry",
     "Entry zone",
     "Entry style",
@@ -316,15 +276,17 @@ def _render_stock_detail(
     _render_daily_chart(str(row["Symbol"]), period, row, raw_row)
 
 
-@st.cache_data(ttl=120, show_spinner=False)
-def _load_daily_bars(symbol: str, period: str, live_ltp: Optional[float] = None) -> pd.DataFrame:
+@st.cache_data(ttl=300, show_spinner=False)
+def _load_daily_bars(symbol: str, period: str) -> pd.DataFrame:
     df = download_daily_single(to_yahoo_nse(symbol), period)
     if df.empty:
         return df
-    out = normalize_daily_index(df)
-    if live_ltp is not None and live_ltp > 0:
-        out = merge_realtime_session(out, live_ltp)
-    return out
+    out = df.copy()
+    idx = pd.to_datetime(out.index)
+    if getattr(idx, "tz", None) is not None:
+        idx = idx.tz_localize(None)
+    out.index = idx.normalize()
+    return out.sort_index()
 
 
 def _nearest_bar_index(index: pd.DatetimeIndex, target: pd.Timestamp) -> Optional[int]:
@@ -632,10 +594,7 @@ def _render_daily_chart(
     raw_row: pd.Series,
 ) -> None:
     st.subheader("Daily chart — entry signal & levels")
-    live_ltp = None
-    if pd.notna(raw_row.get("live_ltp")):
-        live_ltp = float(raw_row["live_ltp"])
-    ohlcv = _load_daily_bars(symbol, period, live_ltp=live_ltp)
+    ohlcv = _load_daily_bars(symbol, period)
     if ohlcv.empty:
         st.warning(f"No daily price data for **{symbol}**.")
         return
@@ -651,7 +610,7 @@ def _render_daily_chart(
 
 
 def _run_scan(cfg: ScannerConfig) -> dict[str, Any]:
-    hits, label, missing, errors, frame_cache, n50_set = run_eod_swing_scan(cfg)
+    hits, label, missing, errors = run_eod_swing_scan(cfg)
     return {
         "raw_df": hits_to_dataframe(hits),
         "label": label,
@@ -659,58 +618,19 @@ def _run_scan(cfg: ScannerConfig) -> dict[str, Any]:
         "errors": errors,
         "match_count": len(hits),
         "period": cfg.period,
-        "frame_cache": frame_cache,
-        "n50_set": n50_set,
-        "use_realtime": cfg.use_realtime,
-        "updated_at": datetime.now().isoformat(),
     }
-
-
-def _refresh_scan_live(scan: dict[str, Any], cfg: ScannerConfig) -> dict[str, Any]:
-    """Fast path: fresh LTP + cached daily bars."""
-    frame_cache = scan.get("frame_cache") or {}
-    n50_set = scan.get("n50_set") or set()
-    if not frame_cache:
-        return scan
-    hits, missing = refresh_hits_live(frame_cache, cfg, n50_set)
-    out = dict(scan)
-    out["raw_df"] = hits_to_dataframe(hits)
-    out["match_count"] = len(hits)
-    out["missing"] = missing
-    out["updated_at"] = datetime.now().isoformat()
-    return out
-
-
-def _market_banner(cfg: ScannerConfig) -> None:
-    status = market_session_status()
-    phase = str(status["phase"]).replace("_", " ")
-    if status["is_open"] and cfg.use_realtime:
-        st.success(
-            f"**NSE open** · {status['as_of']} · Live LTP for trend/RSI/pivots; "
-            f"volume filter uses the **last completed session** until today's volume is in."
-        )
-    elif cfg.use_realtime:
-        st.info(
-            f"**NSE {phase}** · {status['as_of']} · Live LTP on latest bar; "
-            f"volume uses prior session if today's bar is still empty (pre-market)."
-        )
-    else:
-        st.caption(f"**EOD mode** · {status['as_of']} · Using last completed daily bar only.")
 
 
 def main() -> None:
     _inject_dark_theme()
     st.title("EOD Swing Scanner")
     st.caption(
-        "NIFTY 50 + NIFTY 100 · Realtime or EOD · Close > 20 EMA > 50 EMA · Vol > avg · RSI > threshold"
+        "NIFTY 50 + NIFTY 100 universe · Close > 20 EMA > 50 EMA · Volume > 20-day avg · RSI > threshold"
     )
     st.markdown(PIVOT_NOTE)
 
-    cfg, refresh_sec, auto_refresh = _sidebar_config()
-    _market_banner(cfg)
-
-    run_clicked = st.sidebar.button("Run full scan", type="primary", use_container_width=True)
-    refresh_live = st.sidebar.button("Refresh live LTP", use_container_width=True)
+    cfg = _sidebar_config()
+    run_clicked = st.sidebar.button("Run scan", type="primary", use_container_width=True)
     if st.sidebar.button("Clear results", use_container_width=True):
         st.session_state.pop("eod_scan", None)
         st.rerun()
@@ -719,38 +639,24 @@ def main() -> None:
         with st.status("Downloading prices and scanning universe…", expanded=True) as status:
             try:
                 st.session_state["eod_scan"] = _run_scan(cfg)
-                st.session_state["eod_cfg"] = cfg
                 status.update(label="Scan complete", state="complete")
             except Exception as exc:
                 status.update(label=f"Scan failed: {exc}", state="error")
                 st.error(str(exc))
                 return
 
-    if refresh_live and st.session_state.get("eod_scan"):
-        with st.spinner("Refreshing live quotes…"):
-            st.session_state["eod_scan"] = _refresh_scan_live(
-                st.session_state["eod_scan"],
-                cfg,
-            )
-            st.session_state["eod_cfg"] = cfg
-        st.rerun()
-
     scan = st.session_state.get("eod_scan")
     if not scan:
-        st.info("Configure filters in the sidebar, then click **Run full scan**.")
+        st.info("Configure filters in the sidebar, then click **Run scan**.")
         st.markdown(
             """
-**Realtime (recommended during market hours)**
-- Turn on **Realtime (live LTP)** — filters and pivots use today's session with live price.
-- **Refresh live LTP** updates quotes in seconds (no full re-download).
-- **Auto-refresh** keeps the shortlist current for next-day planning.
-
 **Core filters (all required)**
 - Close above 20 EMA and 20 EMA above 50 EMA
 - Session volume above 20-day average
 - RSI(14) above your minimum
 
-**Pivot columns** = S1/S2 stops and R1/R2 targets for the **next** session.
+**Pivot columns** help you set stop loss (S1/S2) and targets (R1/R2) for the next session.
+**Suggested entry** is a dip-buy zone (S1 / pivot / 20 EMA) or breakout above resistance.
 """
         )
         return
@@ -758,15 +664,11 @@ def main() -> None:
     raw_df: pd.DataFrame = scan["raw_df"]
     display_df = _prepare_display_df(raw_df)
 
-    m1, m2, m3, m4, m5 = st.columns(5)
+    m1, m2, m3, m4 = st.columns(4)
     m1.metric("Matches", scan["match_count"])
     m2.metric("Universe", scan["label"])
-    mode_label = "Realtime" if scan.get("use_realtime") else "EOD"
-    m3.metric("Scan mode", mode_label)
-    m4.metric("Missing data", len(scan["missing"]))
-    m5.metric("Download errors", len(scan["errors"]))
-    if scan.get("updated_at"):
-        st.caption(f"Last updated: {scan['updated_at'][:19].replace('T', ' ')}")
+    m3.metric("Missing data", len(scan["missing"]))
+    m4.metric("Download errors", len(scan["errors"]))
 
     if scan["errors"]:
         with st.expander(f"Download errors ({len(scan['errors'])})", expanded=False):
@@ -800,26 +702,7 @@ def main() -> None:
     detail_row = display_df.loc[display_df["Symbol"] == pick].iloc[0]
     raw_row = raw_df.loc[raw_df["symbol"] == pick].iloc[0]
     period = scan.get("period", "1y")
-    if scan.get("use_realtime"):
-        quote = fetch_live_quote(pick)
-        if quote:
-            st.caption(f"Live: **₹{quote.price:,.2f}** · {quote.source}")
     _render_stock_detail(detail_row, raw_row, period=period)
-
-    if cfg.use_realtime and auto_refresh and scan.get("frame_cache"):
-
-        def _tick_live_refresh() -> None:
-            current = st.session_state.get("eod_scan")
-            if not current:
-                return
-            st.session_state["eod_scan"] = _refresh_scan_live(current, cfg)
-
-        try:
-            st.fragment(run_every=timedelta(seconds=refresh_sec))(_tick_live_refresh)()
-        except TypeError:
-            st.caption(
-                f"Auto-refresh needs a newer Streamlit — use **Refresh live LTP** every {refresh_sec}s."
-            )
 
 
 if __name__ == "__main__":

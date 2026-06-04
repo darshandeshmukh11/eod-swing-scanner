@@ -33,19 +33,15 @@ from typing import Optional
 import pandas as pd
 
 from eod_swing_lib import (
-    LiveQuote,
+    _last_completed_bar_idx,
     compute_ema,
     compute_rsi,
     detect_marubozu,
     download_daily_batch,
     download_daily_single,
-    fetch_live_quotes_batch,
     get_nifty50_and_100_universe,
     get_nifty50_symbols,
     infer_support_resistance,
-    merge_realtime_session,
-    normalize_daily_index,
-    session_bar_indices,
     to_yahoo_nse,
 )
 
@@ -56,8 +52,6 @@ class ScannerConfig:
     batch_size: int = 12
     download_delay: float = 0.12
     prefer_live_symbols: bool = True
-    use_realtime: bool = True
-    live_workers: int = 8
     min_rsi: float = 55.0
     ema_fast: int = 20
     ema_slow: int = 50
@@ -94,10 +88,6 @@ class ScanHit:
     r2: Optional[float] = None
     patterns: list[str] = field(default_factory=list)
     as_of: str = ""
-    session_mode: str = "eod"
-    live_ltp: Optional[float] = None
-    live_source: str = ""
-    prior_close: Optional[float] = None
 
 
 def _is_hammer_bar(o: float, h: float, low: float, c: float) -> bool:
@@ -174,72 +164,44 @@ def evaluate_symbol(
     df: pd.DataFrame,
     cfg: ScannerConfig,
     universe_label: str,
-    *,
-    live_quote: Optional[LiveQuote] = None,
 ) -> Optional[ScanHit]:
     if len(df) < cfg.min_history_bars:
         return None
 
-    work = normalize_daily_index(df)
-    live_ltp: Optional[float] = None
-    live_source = ""
-    if cfg.use_realtime:
-        if live_quote is not None:
-            work = merge_realtime_session(work, live_quote.price)
-            live_ltp = live_quote.price
-            live_source = live_quote.source
-        elif len(work) > 0:
-            live_ltp = float(work["Close"].iloc[-1])
-
-    price_idx, volume_idx, today_developing = session_bar_indices(
-        work,
-        realtime=cfg.use_realtime,
-        volume_ma_period=cfg.volume_ma_period,
-    )
-    if price_idx < 0 or price_idx >= len(work):
-        return None
-
-    close_s = work["Close"].astype(float)
-    price = float(live_ltp) if live_ltp is not None else float(close_s.iloc[price_idx])
-    prior_close = float(close_s.iloc[price_idx - 1]) if price_idx > 0 else price
-    ema20 = float(compute_ema(close_s, cfg.ema_fast).iloc[price_idx])
-    ema50 = float(compute_ema(close_s, cfg.ema_slow).iloc[price_idx])
+    idx = _last_completed_bar_idx(df)
+    close_s = df["Close"].astype(float)
+    price = float(close_s.iloc[idx])
+    ema20 = float(compute_ema(close_s, cfg.ema_fast).iloc[idx])
+    ema50 = float(compute_ema(close_s, cfg.ema_slow).iloc[idx])
 
     if not (price > ema20 > ema50):
         return None
 
-    rsi = float(compute_rsi(close_s, cfg.rsi_period).iloc[price_idx])
+    rsi = float(compute_rsi(close_s, cfg.rsi_period).iloc[idx])
     if rsi <= cfg.min_rsi:
         return None
 
-    vol = work["Volume"].astype(float)
-    avg_vol = float(vol.rolling(cfg.volume_ma_period).mean().iloc[volume_idx])
-    last_vol = float(vol.iloc[volume_idx])
+    vol = df["Volume"].astype(float)
+    avg_vol = float(vol.rolling(cfg.volume_ma_period).mean().iloc[idx])
+    last_vol = float(vol.iloc[idx])
     if avg_vol <= 0 or last_vol <= avg_vol:
         return None
 
-    support, resistance, _ = infer_support_resistance(work, price, cfg.sr_lookback_days)
+    support, resistance, _ = infer_support_resistance(df, price, cfg.sr_lookback_days)
     dist_ema_pct = abs(price - ema20) / ema20 * 100.0 if ema20 > 0 else 999.0
     dist_support_pct = (price - support) / price * 100.0 if price > 0 else 999.0
 
     near_ema = dist_ema_pct <= cfg.near_ema_pct
     near_support = dist_support_pct <= cfg.near_support_pct
 
-    prev_close = float(close_s.iloc[price_idx - 1]) if price_idx > 0 else price
+    prev_close = float(close_s.iloc[idx - 1]) if idx > 0 else price
     breakout = price > resistance * (1.0 + cfg.breakout_buffer_pct / 100.0) and prev_close <= resistance
 
-    pattern_idx = volume_idx if today_developing else price_idx
-    patterns = detect_patterns_at_idx(work, pattern_idx)
+    patterns = detect_patterns_at_idx(df, idx)
     vol_vs_avg = (last_vol - avg_vol) / avg_vol * 100.0 if avg_vol > 0 else 0.0
-    bar_date = pd.Timestamp(work.index[price_idx]).strftime("%Y-%m-%d")
-    if cfg.use_realtime and live_ltp is not None:
-        as_of = f"{bar_date} (live)"
-        session_mode = "realtime"
-    else:
-        as_of = bar_date
-        session_mode = "eod"
+    as_of = pd.Timestamp(df.index[idx]).strftime("%Y-%m-%d")
 
-    pivot, s1, s2, r1, r2 = immediate_floor_pivots(work, price_idx)
+    pivot, s1, s2, r1, r2 = immediate_floor_pivots(df, idx)
 
     return ScanHit(
         symbol=symbol,
@@ -263,10 +225,6 @@ def evaluate_symbol(
         r2=r2,
         patterns=patterns,
         as_of=as_of,
-        session_mode=session_mode,
-        live_ltp=round(live_ltp, 2) if live_ltp is not None else None,
-        live_source=live_source,
-        prior_close=round(prior_close, 2),
     )
 
 
@@ -278,13 +236,12 @@ def _scan_universe(
     symbols: list[str],
     cfg: ScannerConfig,
     n50_set: set[str],
-) -> tuple[list[ScanHit], list[str], list[str], dict[str, pd.DataFrame]]:
+) -> tuple[list[ScanHit], list[str], list[str]]:
     yahoo_map = {s: to_yahoo_nse(s) for s in symbols}
     yahoo_tickers = [yahoo_map[s] for s in symbols]
     hits: list[ScanHit] = []
     missing: list[str] = []
     errors: list[str] = []
-    frame_cache: dict[str, pd.DataFrame] = {}
 
     total_batches = max(1, (len(yahoo_tickers) + cfg.batch_size - 1) // cfg.batch_size)
     for batch_idx, i in enumerate(range(0, len(yahoo_tickers), cfg.batch_size)):
@@ -298,10 +255,6 @@ def _scan_universe(
             errors.append(f"{batch_nse[0]}: {exc}")
             frames = {}
 
-        live_quotes: dict[str, LiveQuote] = {}
-        if cfg.use_realtime:
-            live_quotes = fetch_live_quotes_batch(batch_nse, max_workers=cfg.live_workers)
-
         for nse_symbol, yahoo_ticker in zip(batch_nse, batch_yahoo):
             frame = frames.get(yahoo_ticker)
             if frame is None or frame.empty:
@@ -309,16 +262,8 @@ def _scan_universe(
             if frame is None or frame.empty:
                 missing.append(nse_symbol)
                 continue
-            frame_cache[nse_symbol] = frame.copy()
             label = _universe_label(nse_symbol, n50_set)
-            hit = evaluate_symbol(
-                nse_symbol,
-                yahoo_ticker,
-                frame,
-                cfg,
-                label,
-                live_quote=live_quotes.get(nse_symbol),
-            )
+            hit = evaluate_symbol(nse_symbol, yahoo_ticker, frame, cfg, label)
             if hit is not None:
                 hits.append(hit)
 
@@ -326,42 +271,7 @@ def _scan_universe(
             time.sleep(cfg.download_delay)
 
     hits.sort(key=lambda h: (len(h.patterns), h.rsi, h.vol_vs_avg_pct), reverse=True)
-    return hits, missing, errors, frame_cache
-
-
-def refresh_hits_live(
-    frame_cache: dict[str, pd.DataFrame],
-    cfg: ScannerConfig,
-    n50_set: set[str],
-) -> tuple[list[ScanHit], list[str]]:
-    """Re-evaluate universe with fresh LTP using cached daily OHLCV (fast refresh)."""
-    if not frame_cache:
-        return [], ["No cached price history — run a full scan first."]
-
-    symbols = sorted(frame_cache.keys())
-    live_quotes = fetch_live_quotes_batch(symbols, max_workers=cfg.live_workers)
-    hits: list[ScanHit] = []
-    missing: list[str] = []
-
-    for nse_symbol in symbols:
-        frame = frame_cache.get(nse_symbol)
-        if frame is None or frame.empty:
-            missing.append(nse_symbol)
-            continue
-        label = _universe_label(nse_symbol, n50_set)
-        hit = evaluate_symbol(
-            nse_symbol,
-            to_yahoo_nse(nse_symbol),
-            frame,
-            cfg,
-            label,
-            live_quote=live_quotes.get(nse_symbol),
-        )
-        if hit is not None:
-            hits.append(hit)
-
-    hits.sort(key=lambda h: (len(h.patterns), h.rsi, h.vol_vs_avg_pct), reverse=True)
-    return hits, missing
+    return hits, missing, errors
 
 
 def run_eod_swing_scan(
@@ -370,8 +280,6 @@ def run_eod_swing_scan(
     cfg = cfg or ScannerConfig()
 
     print("EOD swing scanner")
-    mode = "realtime (live LTP)" if cfg.use_realtime else "EOD (last completed bar)"
-    print(f"  Mode:   {mode}")
     print(f"  Trend:  Close > {cfg.ema_fast} EMA > {cfg.ema_slow} EMA")
     print(f"  Volume: > {cfg.volume_ma_period}-day average")
     print(f"  RSI:    > {cfg.min_rsi}")
@@ -389,14 +297,14 @@ def run_eod_swing_scan(
         print(f"  Universe: {len(symbols)} symbols ({n50_only} NIFTY 50 + {n100_only} NIFTY 100-only)")
         print()
 
-    hits, missing, errors, frame_cache = _scan_universe(symbols, cfg, n50_set)
+    hits, missing, errors = _scan_universe(symbols, cfg, n50_set)
 
     if errors:
         print(f"  Download errors: {len(errors)} (first: {errors[0]})")
     if missing:
         print(f"  Missing data: {len(missing)} symbols")
 
-    return hits, scanned_label, missing, errors, frame_cache, n50_set
+    return hits, scanned_label, missing, errors
 
 
 @dataclass
@@ -485,10 +393,6 @@ def hits_to_dataframe(hits: list[ScanHit]) -> pd.DataFrame:
                 "entry_style": entry.entry_style,
                 "entry_note": entry.note,
                 "patterns": ", ".join(h.patterns) if h.patterns else "—",
-                "session_mode": h.session_mode,
-                "live_ltp": h.live_ltp,
-                "live_source": h.live_source or "—",
-                "prior_close": h.prior_close,
             }
         )
     return pd.DataFrame(rows)
@@ -502,16 +406,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--period", default="1y")
     p.add_argument("--nifty50-only", action="store_true", help="Scan only NIFTY 50 (skip NIFTY 100-only names)")
     p.add_argument("--static-symbols", action="store_true", help="Skip Wikipedia symbol fetch")
-    p.add_argument(
-        "--realtime",
-        action="store_true",
-        help="Use live LTP on today's session bar (intraday filters & pivots for next day)",
-    )
-    p.add_argument(
-        "--eod-only",
-        action="store_true",
-        help="Use last completed daily bar only (skip live LTP)",
-    )
     p.add_argument("-o", "--output", help="Write CSV path")
     p.add_argument("--delay", type=float, default=0.12)
     return p.parse_args()
@@ -519,7 +413,6 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    use_realtime = args.realtime or not args.eod_only
     cfg = ScannerConfig(
         period=args.period,
         min_rsi=args.min_rsi,
@@ -528,10 +421,9 @@ def main() -> int:
         prefer_live_symbols=not args.static_symbols,
         nifty50_only=args.nifty50_only,
         download_delay=args.delay,
-        use_realtime=use_realtime,
     )
 
-    hits, label, missing, errors, _frames, _n50 = run_eod_swing_scan(cfg)
+    hits, label, missing, errors = run_eod_swing_scan(cfg)
     df = hits_to_dataframe(hits)
 
     print()
