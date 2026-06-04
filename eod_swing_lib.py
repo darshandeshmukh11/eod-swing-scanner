@@ -8,11 +8,19 @@ modules required at import time.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from datetime import datetime, time
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
 import yfinance as yf
+
+IST = ZoneInfo("Asia/Kolkata")
+NSE_MARKET_OPEN = time(9, 15)
+NSE_MARKET_CLOSE = time(15, 30)
 
 _OHLCV_COLS = ("Open", "High", "Low", "Close", "Volume")
 
@@ -352,19 +360,242 @@ def infer_support_resistance(
     return nearest_support, nearest_resistance, atr_value
 
 
+def ist_now() -> datetime:
+    return datetime.now(IST)
+
+
+def _today_ts() -> pd.Timestamp:
+    return pd.Timestamp(ist_now().date())
+
+
+def market_session_status() -> dict[str, str | bool]:
+    """NSE cash session phase for UI banners."""
+    now = ist_now()
+    weekday = now.weekday()
+    t = now.time()
+    as_of = now.strftime("%a %d %b %Y, %H:%M IST")
+
+    if weekday >= 5:
+        return {"phase": "closed (weekend)", "is_open": False, "as_of": as_of}
+    if t < NSE_MARKET_OPEN:
+        return {"phase": "pre-open", "is_open": False, "as_of": as_of}
+    if t <= NSE_MARKET_CLOSE:
+        return {"phase": "open", "is_open": True, "as_of": as_of}
+    return {"phase": "closed", "is_open": False, "as_of": as_of}
+
+
+@dataclass
+class LiveQuote:
+    symbol: str
+    yahoo: str
+    price: float
+    day_high: float
+    day_low: float
+    volume: float
+
+
+def normalize_daily_index(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    out = df.copy()
+    idx = pd.to_datetime(out.index)
+    if getattr(idx, "tz", None) is not None:
+        idx = idx.tz_convert(IST)
+    else:
+        idx = idx.tz_localize(IST)
+    out.index = idx.normalize().tz_localize(None)
+    return out.sort_index()
+
+
+def merge_realtime_session(
+    df: pd.DataFrame,
+    live_price: float,
+    *,
+    day_high: Optional[float] = None,
+    day_low: Optional[float] = None,
+    day_volume: Optional[float] = None,
+) -> pd.DataFrame:
+    """Patch or append today's daily bar with live LTP (and optional session H/L/volume)."""
+    out = normalize_daily_index(df)
+    if out.empty:
+        return out
+
+    live_price = float(live_price)
+    today_ts = _today_ts()
+    hi = float(day_high) if day_high and day_high > 0 else live_price
+    low = float(day_low) if day_low and day_low > 0 else live_price
+
+    if out.index[-1] >= today_ts:
+        o = float(out["Open"].iloc[-1])
+        h = max(float(out["High"].iloc[-1]), hi, live_price)
+        low_val = min(float(out["Low"].iloc[-1]), low, live_price)
+        out.iloc[-1, out.columns.get_loc("High")] = h
+        out.iloc[-1, out.columns.get_loc("Low")] = low_val
+        out.iloc[-1, out.columns.get_loc("Close")] = live_price
+        if day_volume is not None and day_volume > 0 and "Volume" in out.columns:
+            out.iloc[-1, out.columns.get_loc("Volume")] = float(day_volume)
+    else:
+        prev_close = float(out["Close"].iloc[-1])
+        vol = float(day_volume) if day_volume and day_volume > 0 else 0.0
+        out.loc[today_ts] = {
+            "Open": prev_close,
+            "High": max(prev_close, hi, live_price),
+            "Low": min(prev_close, low, live_price),
+            "Close": live_price,
+            "Volume": vol,
+        }
+    return out
+
+
+def has_today_bar(df: pd.DataFrame) -> bool:
+    if df.empty:
+        return False
+    return pd.Timestamp(df.index[-1]).normalize() >= _today_ts()
+
+
 def _last_completed_bar_idx(df: pd.DataFrame) -> int:
     """Use prior session when the latest row is still today's incomplete daily bar."""
     if len(df) < 2:
         return -1
-    last_ts = pd.Timestamp(df.index[-1])
-    if last_ts.tz is not None:
-        last_ts = last_ts.tz_convert("Asia/Kolkata")
-    else:
-        last_ts = last_ts.tz_localize("Asia/Kolkata")
-    today = pd.Timestamp.now(tz="Asia/Kolkata").normalize()
-    if last_ts.normalize() >= today:
+    if has_today_bar(df):
         return -2
     return -1
+
+
+def session_is_developing(df: pd.DataFrame, volume_ma_period: int = 20) -> bool:
+    """
+    True when today's bar should not drive volume/pattern filters yet.
+
+    During NSE hours we always treat volume as developing; after hours we use
+    today's bar only when session volume is a meaningful fraction of the 20-day avg.
+    """
+    if not has_today_bar(df) or len(df) < 2:
+        return False
+
+    now = ist_now()
+    if now.weekday() < 5 and NSE_MARKET_OPEN <= now.time() <= NSE_MARKET_CLOSE:
+        return True
+
+    idx = len(df) - 1
+    vol = float(df["Volume"].astype(float).iloc[idx])
+    if vol <= 0:
+        return True
+
+    avg_series = df["Volume"].astype(float).rolling(volume_ma_period).mean()
+    avg_vol = float(avg_series.iloc[idx - 1]) if idx >= 1 else 0.0
+    if avg_vol > 0 and vol < avg_vol * 0.25:
+        return True
+    return False
+
+
+def session_bar_indices(
+    df: pd.DataFrame,
+    volume_ma_period: int = 20,
+    *,
+    realtime: bool,
+) -> tuple[int, int, int]:
+    """Return (price_idx, volume_idx, pattern_idx) for filter evaluation."""
+    if not realtime:
+        idx = _last_completed_bar_idx(df)
+        return idx, idx, idx
+
+    price_idx = len(df) - 1
+    if session_is_developing(df, volume_ma_period):
+        vol_idx = _last_completed_bar_idx(df)
+    else:
+        vol_idx = price_idx
+    return price_idx, vol_idx, vol_idx
+
+
+def _pick_positive(*values: object) -> Optional[float]:
+    for val in values:
+        if val is None:
+            continue
+        try:
+            num = float(val)
+        except (TypeError, ValueError):
+            continue
+        if num > 0:
+            return num
+    return None
+
+
+def fetch_live_quote(nse_symbol: str) -> Optional[LiveQuote]:
+    """Latest LTP for an NSE symbol via Yahoo Finance."""
+    yahoo = to_yahoo_nse(nse_symbol)
+    try:
+        ticker = yf.Ticker(yahoo)
+        price: Optional[float] = None
+        day_high = 0.0
+        day_low = 0.0
+        volume = 0.0
+
+        try:
+            fi = ticker.fast_info
+            price = _pick_positive(
+                getattr(fi, "last_price", None),
+                getattr(fi, "lastPrice", None),
+            )
+            day_high = float(getattr(fi, "day_high", 0) or getattr(fi, "dayHigh", 0) or price or 0)
+            day_low = float(getattr(fi, "day_low", 0) or getattr(fi, "dayLow", 0) or price or 0)
+            volume = float(getattr(fi, "last_volume", 0) or getattr(fi, "lastVolume", 0) or 0)
+        except Exception:
+            pass
+
+        if price is None:
+            info = ticker.info or {}
+            price = _pick_positive(
+                info.get("regularMarketPrice"),
+                info.get("currentPrice"),
+                info.get("previousClose"),
+            )
+            day_high = float(info.get("dayHigh") or info.get("regularMarketDayHigh") or price or 0)
+            day_low = float(info.get("dayLow") or info.get("regularMarketDayLow") or price or 0)
+            volume = float(info.get("volume") or info.get("regularMarketVolume") or 0)
+
+        if price is None:
+            hist = ticker.history(period="5d", interval="1d")
+            if hist is not None and not hist.empty:
+                price = float(hist["Close"].iloc[-1])
+                day_high = float(hist["High"].iloc[-1])
+                day_low = float(hist["Low"].iloc[-1])
+                volume = float(hist["Volume"].iloc[-1]) if "Volume" in hist.columns else 0.0
+
+        if price is None or price <= 0:
+            return None
+
+        return LiveQuote(
+            symbol=nse_symbol,
+            yahoo=yahoo,
+            price=round(price, 2),
+            day_high=round(day_high or price, 2),
+            day_low=round(day_low or price, 2),
+            volume=volume,
+        )
+    except Exception:
+        return None
+
+
+def fetch_live_quotes_batch(
+    nse_symbols: list[str],
+    *,
+    max_workers: int = 10,
+) -> dict[str, LiveQuote]:
+    if not nse_symbols:
+        return {}
+    out: dict[str, LiveQuote] = {}
+    workers = min(max_workers, max(1, len(nse_symbols)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(fetch_live_quote, sym): sym for sym in nse_symbols}
+        for fut in as_completed(futures):
+            sym = futures[fut]
+            try:
+                quote = fut.result()
+            except Exception:
+                quote = None
+            if quote and quote.price > 0:
+                out[sym] = quote
+    return out
 
 
 # --- Candlestick patterns -----------------------------------------------------

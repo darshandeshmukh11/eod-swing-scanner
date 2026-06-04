@@ -12,6 +12,7 @@ Run:
 from __future__ import annotations
 
 import io
+from datetime import datetime, timedelta
 from typing import Any, Optional
 
 import pandas as pd
@@ -19,8 +20,20 @@ import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
 
-from eod_swing_lib import compute_ema, download_daily_single, to_yahoo_nse
-from eod_swing_scanner import ScannerConfig, hits_to_dataframe, run_eod_swing_scan
+from eod_swing_lib import (
+    compute_ema,
+    download_daily_single,
+    fetch_live_quote,
+    market_session_status,
+    merge_realtime_session,
+    to_yahoo_nse,
+)
+from eod_swing_scanner import (
+    ScannerConfig,
+    hits_to_dataframe,
+    reevaluate_hits_from_cache,
+    run_eod_swing_scan,
+)
 
 st.set_page_config(
     page_title="EOD Swing Scanner",
@@ -32,7 +45,8 @@ st.set_page_config(
 PIVOT_NOTE = (
     "Floor pivots from the **scanned session** high / low / close — levels for the "
     "**next** session. **Buy zone** = scale-in area · **Sell zone** = target trim area. "
-    "Use **S1 / S2** for stop-loss."
+    "Use **S1 / S2** for stop-loss. With **Realtime** on, close/RSI/pivots use **live LTP**; "
+    "volume filter uses the **last completed session** until today's volume is meaningful."
 )
 
 
@@ -75,6 +89,26 @@ def _sidebar_config() -> ScannerConfig:
     near_ema_pct = st.sidebar.slider("Near 20 EMA (%)", 0.5, 5.0, 2.0, 0.25)
     near_support_pct = st.sidebar.slider("Near support (%)", 1.0, 8.0, 3.5, 0.25)
 
+    st.sidebar.subheader("Realtime")
+    use_realtime = st.sidebar.checkbox(
+        "Realtime (live LTP)",
+        value=True,
+        help="Merge Yahoo LTP into today's bar for trend, RSI, and next-session pivots.",
+    )
+    auto_refresh = st.sidebar.checkbox(
+        "Auto-refresh LTP",
+        value=use_realtime,
+        disabled=not use_realtime,
+    )
+    refresh_sec = st.sidebar.slider(
+        "Refresh interval (sec)",
+        30,
+        300,
+        90,
+        15,
+        disabled=not (use_realtime and auto_refresh),
+    )
+
     return ScannerConfig(
         period=period,
         min_rsi=float(min_rsi),
@@ -82,7 +116,8 @@ def _sidebar_config() -> ScannerConfig:
         near_support_pct=float(near_support_pct),
         prefer_live_symbols=prefer_live,
         nifty50_only=nifty50_only,
-    )
+        use_realtime=use_realtime,
+    ), auto_refresh, refresh_sec
 
 
 def _prepare_display_df(raw: pd.DataFrame) -> pd.DataFrame:
@@ -199,6 +234,7 @@ def _render_stock_detail(
     raw_row: pd.Series,
     *,
     period: str,
+    use_live: bool = False,
 ) -> None:
     close = float(row["Close"])
     s1, s2 = float(row["Stop (S1)"]), float(row["Stop (S2)"])
@@ -273,11 +309,11 @@ def _render_stock_detail(
     if row.get("Patterns") and row["Patterns"] != "—":
         st.info(f"Candlestick: **{row['Patterns']}**")
 
-    _render_daily_chart(str(row["Symbol"]), period, row, raw_row)
+    _render_daily_chart(str(row["Symbol"]), period, row, raw_row, use_live=use_live)
 
 
-@st.cache_data(ttl=300, show_spinner=False)
-def _load_daily_bars(symbol: str, period: str) -> pd.DataFrame:
+@st.cache_data(ttl=120, show_spinner=False)
+def _load_daily_bars(symbol: str, period: str, use_live: bool = False) -> pd.DataFrame:
     df = download_daily_single(to_yahoo_nse(symbol), period)
     if df.empty:
         return df
@@ -286,7 +322,18 @@ def _load_daily_bars(symbol: str, period: str) -> pd.DataFrame:
     if getattr(idx, "tz", None) is not None:
         idx = idx.tz_localize(None)
     out.index = idx.normalize()
-    return out.sort_index()
+    out = out.sort_index()
+    if use_live:
+        quote = fetch_live_quote(symbol)
+        if quote and quote.price > 0:
+            out = merge_realtime_session(
+                out,
+                quote.price,
+                day_high=quote.day_high,
+                day_low=quote.day_low,
+                day_volume=quote.volume if quote.volume > 0 else None,
+            )
+    return out
 
 
 def _nearest_bar_index(index: pd.DatetimeIndex, target: pd.Timestamp) -> Optional[int]:
@@ -592,9 +639,11 @@ def _render_daily_chart(
     period: str,
     display_row: pd.Series,
     raw_row: pd.Series,
+    *,
+    use_live: bool = False,
 ) -> None:
     st.subheader("Daily chart — entry signal & levels")
-    ohlcv = _load_daily_bars(symbol, period)
+    ohlcv = _load_daily_bars(symbol, period, use_live=use_live)
     if ohlcv.empty:
         st.warning(f"No daily price data for **{symbol}**.")
         return
@@ -610,7 +659,7 @@ def _render_daily_chart(
 
 
 def _run_scan(cfg: ScannerConfig) -> dict[str, Any]:
-    hits, label, missing, errors = run_eod_swing_scan(cfg)
+    hits, label, missing, errors, frame_cache, n50_set = run_eod_swing_scan(cfg)
     return {
         "raw_df": hits_to_dataframe(hits),
         "label": label,
@@ -618,7 +667,22 @@ def _run_scan(cfg: ScannerConfig) -> dict[str, Any]:
         "errors": errors,
         "match_count": len(hits),
         "period": cfg.period,
+        "frame_cache": frame_cache,
+        "n50_set": n50_set,
+        "updated_at": datetime.now().isoformat(),
+        "use_realtime": cfg.use_realtime,
     }
+
+
+def _refresh_scan_live(scan: dict[str, Any], cfg: ScannerConfig) -> dict[str, Any]:
+    frame_cache = scan.get("frame_cache") or {}
+    n50_set = scan.get("n50_set") or set()
+    hits = reevaluate_hits_from_cache(frame_cache, cfg, n50_set)
+    out = dict(scan)
+    out["raw_df"] = hits_to_dataframe(hits)
+    out["match_count"] = len(hits)
+    out["updated_at"] = datetime.now().isoformat()
+    return out
 
 
 def main() -> None:
@@ -629,25 +693,61 @@ def main() -> None:
     )
     st.markdown(PIVOT_NOTE)
 
-    cfg = _sidebar_config()
-    run_clicked = st.sidebar.button("Run scan", type="primary", use_container_width=True)
+    cfg, auto_refresh, refresh_sec = _sidebar_config()
+    status = market_session_status()
+
+    run_clicked = st.sidebar.button("Run full scan", type="primary", use_container_width=True)
+    refresh_clicked = st.sidebar.button(
+        "Refresh live LTP",
+        use_container_width=True,
+        disabled=not cfg.use_realtime,
+        help="Re-fetch LTP and re-filter cached history (no full re-download).",
+    )
     if st.sidebar.button("Clear results", use_container_width=True):
         st.session_state.pop("eod_scan", None)
         st.rerun()
 
     if run_clicked:
-        with st.status("Downloading prices and scanning universe…", expanded=True) as status:
+        with st.status("Downloading prices and scanning universe…", expanded=True) as scan_status:
             try:
                 st.session_state["eod_scan"] = _run_scan(cfg)
-                status.update(label="Scan complete", state="complete")
+                scan_status.update(label="Scan complete", state="complete")
             except Exception as exc:
-                status.update(label=f"Scan failed: {exc}", state="error")
+                scan_status.update(label=f"Scan failed: {exc}", state="error")
                 st.error(str(exc))
                 return
 
+    if refresh_clicked and st.session_state.get("eod_scan"):
+        with st.spinner("Refreshing live LTP…"):
+            st.session_state["eod_scan"] = _refresh_scan_live(st.session_state["eod_scan"], cfg)
+        st.rerun()
+
     scan = st.session_state.get("eod_scan")
+
+    if scan and cfg.use_realtime and auto_refresh and scan.get("frame_cache"):
+        updated = scan.get("updated_at")
+        if updated:
+            try:
+                ts = datetime.fromisoformat(updated)
+                if datetime.now() - ts >= timedelta(seconds=refresh_sec):
+                    st.session_state["eod_scan"] = _refresh_scan_live(scan, cfg)
+                    st.rerun()
+            except ValueError:
+                pass
+
+    if cfg.use_realtime:
+        if status["is_open"]:
+            st.success(
+                f"**NSE open** · {status['as_of']} · Live LTP for trend/RSI/pivots; "
+                f"volume filter uses the **last completed session** until today's volume is in."
+            )
+        else:
+            st.info(
+                f"**NSE {status['phase']}** · {status['as_of']} · Live LTP still updates last bar; "
+                f"pivots use latest session H/L/C."
+            )
     if not scan:
-        st.info("Configure filters in the sidebar, then click **Run scan**.")
+        st.info("Configure filters in the sidebar, then click **Run full scan**.")
         st.markdown(
             """
 **Core filters (all required)**
@@ -664,15 +764,29 @@ def main() -> None:
     raw_df: pd.DataFrame = scan["raw_df"]
     display_df = _prepare_display_df(raw_df)
 
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Matches", scan["match_count"])
-    m2.metric("Universe", scan["label"])
-    m3.metric("Missing data", len(scan["missing"]))
-    m4.metric("Download errors", len(scan["errors"]))
+    mode_label = "Live LTP" if scan.get("use_realtime") else "EOD"
+    updated = scan.get("updated_at", "")
+    updated_short = ""
+    if updated:
+        try:
+            updated_short = datetime.fromisoformat(updated).strftime("%H:%M:%S")
+        except ValueError:
+            updated_short = updated
 
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Matches", scan["match_count"])
+    m2.metric("Mode", mode_label)
+    m3.metric("Universe", scan["label"])
+    m4.metric("Missing data", len(scan["missing"]))
+    m5.metric("Updated", updated_short or "—")
     if scan["errors"]:
-        with st.expander(f"Download errors ({len(scan['errors'])})", expanded=False):
+        st.caption(f"Download errors: {len(scan['errors'])}")
+
+    with st.expander(f"Download errors ({len(scan['errors'])})", expanded=False):
+        if scan["errors"]:
             st.code("\n".join(scan["errors"][:20]))
+        else:
+            st.caption("None")
 
     if display_df.empty:
         st.warning("No stocks passed all core filters for the current settings.")
@@ -702,7 +816,12 @@ def main() -> None:
     detail_row = display_df.loc[display_df["Symbol"] == pick].iloc[0]
     raw_row = raw_df.loc[raw_df["symbol"] == pick].iloc[0]
     period = scan.get("period", "1y")
-    _render_stock_detail(detail_row, raw_row, period=period)
+    _render_stock_detail(
+        detail_row,
+        raw_row,
+        period=period,
+        use_live=bool(scan.get("use_realtime")),
+    )
 
 
 if __name__ == "__main__":

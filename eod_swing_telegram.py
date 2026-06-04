@@ -119,7 +119,7 @@ def main() -> int:
         download_delay=args.delay,
     )
 
-    hits, scanned_label, missing, errors = run_eod_swing_scan(cfg)
+    hits, scanned_label, missing, errors, _frame_cache, _n50 = run_eod_swing_scan(cfg)
     message = format_swing_scan_telegram(hits, scanned_label, missing=missing, errors=errors)
 
     if args.output and hits:
