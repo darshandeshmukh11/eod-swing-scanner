@@ -336,6 +336,16 @@ def _load_daily_bars(symbol: str, period: str, use_live: bool = False) -> pd.Dat
     return out
 
 
+def _parse_as_of_date(as_of: object) -> pd.Timestamp:
+    """Parse scanner ``As of`` value (e.g. ``2026-06-04`` or ``2026-06-04 (live)``)."""
+    text = str(as_of).strip()
+    if not text or text == "—":
+        return pd.Timestamp.today().normalize()
+    if " (" in text:
+        text = text.split(" (", 1)[0].strip()
+    return pd.Timestamp(text).normalize()
+
+
 def _nearest_bar_index(index: pd.DatetimeIndex, target: pd.Timestamp) -> Optional[int]:
     if index.empty:
         return None
@@ -401,7 +411,7 @@ def build_daily_swing_chart(
     pivot = float(display_row["Pivot"])
     support = float(display_row["Support"])
     resistance = float(display_row["Resistance"])
-    signal_date = pd.Timestamp(display_row["As of"])
+    signal_date = _parse_as_of_date(display_row["As of"])
     buy_zone, sell_zone = _compute_buy_sell_zones(display_row, raw_row)
 
     fig = make_subplots(
