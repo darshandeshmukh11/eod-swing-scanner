@@ -675,10 +675,9 @@ def _scan_timestamp_iso() -> str:
     return ist_now().isoformat()
 
 
-def _format_updated_at(iso_value: str) -> str:
-    """Human-readable IST label: ``06 Jun 2026, 15:29 IST``."""
+def _parse_updated_ist(iso_value: str) -> datetime | None:
     if not iso_value:
-        return ""
+        return None
     try:
         ts = datetime.fromisoformat(iso_value)
         if ts.tzinfo is None:
@@ -686,9 +685,35 @@ def _format_updated_at(iso_value: str) -> str:
             ts = ts.replace(tzinfo=timezone.utc).astimezone(IST)
         else:
             ts = ts.astimezone(IST)
-        return ts.strftime("%d %b %Y, %H:%M IST")
+        return ts
     except ValueError:
-        return iso_value
+        return None
+
+
+def _render_summary_stat(
+    container: Any,
+    title: str,
+    primary: str,
+    *,
+    secondary: str = "",
+    primary_size: str = "1.5rem",
+    nowrap: bool = True,
+) -> None:
+    """Metric-style block without st.metric truncation (ellipsis in narrow columns)."""
+    wrap = "white-space:nowrap;" if nowrap else "white-space:normal;line-height:1.35;"
+    secondary_html = ""
+    if secondary:
+        secondary_html = (
+            '<p style="margin:0.15rem 0 0 0;font-size:0.875rem;color:rgba(250,250,250,0.65);'
+            f'white-space:nowrap;">{secondary}</p>'
+        )
+    container.markdown(
+        '<p style="margin:0 0 0.2rem 0;font-size:0.875rem;color:rgba(250,250,250,0.65);">'
+        f"{title}</p>"
+        f'<p style="margin:0;font-size:{primary_size};font-weight:600;{wrap}">{primary}</p>'
+        f"{secondary_html}",
+        unsafe_allow_html=True,
+    )
 
 
 def _run_scan(cfg: ScannerConfig) -> dict[str, Any]:
@@ -802,14 +827,35 @@ def main() -> None:
     display_df = _prepare_display_df(raw_df)
 
     mode_label = "Live LTP" if scan.get("use_realtime") else "EOD"
-    updated_label = _format_updated_at(scan.get("updated_at", ""))
+    updated_ts = _parse_updated_ist(scan.get("updated_at", ""))
 
-    m1, m2, m3, m4, m5 = st.columns(5)
+    m1, m2, m3, m4, m5 = st.columns([0.9, 0.9, 1.8, 0.9, 1.3])
     m1.metric("Matches", scan["match_count"])
     m2.metric("Mode", mode_label)
-    m3.metric("Universe", scan["label"])
+    universe_label = str(scan["label"])
+    universe_primary = universe_label
+    universe_secondary = ""
+    if " (" in universe_label and universe_label.endswith(")"):
+        universe_primary, universe_secondary = universe_label.split(" (", 1)
+        universe_secondary = f"({universe_secondary}"
+    _render_summary_stat(
+        m3,
+        "Universe",
+        universe_primary,
+        secondary=universe_secondary,
+        primary_size="1rem",
+        nowrap=False,
+    )
     m4.metric("Missing data", len(scan["missing"]))
-    m5.metric("Updated (IST)", updated_label or "—")
+    if updated_ts is not None:
+        _render_summary_stat(
+            m5,
+            "Updated (IST)",
+            updated_ts.strftime("%H:%M:%S"),
+            secondary=updated_ts.strftime("%d %b %Y"),
+        )
+    else:
+        _render_summary_stat(m5, "Updated (IST)", "—")
     if scan["errors"]:
         st.caption(f"Download errors: {len(scan['errors'])}")
 
