@@ -12,7 +12,7 @@ Run:
 from __future__ import annotations
 
 import io
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 import pandas as pd
@@ -21,9 +21,11 @@ import streamlit as st
 from plotly.subplots import make_subplots
 
 from eod_swing_lib import (
+    IST,
     compute_ema,
     download_daily_single,
     fetch_live_quote,
+    ist_now,
     market_session_status,
     merge_realtime_session,
     to_yahoo_nse,
@@ -668,6 +670,27 @@ def _render_daily_chart(
     st.caption(cap)
 
 
+def _scan_timestamp_iso() -> str:
+    """IST timestamp for scan / LTP refresh (matches NSE session banner)."""
+    return ist_now().isoformat()
+
+
+def _format_updated_at(iso_value: str) -> str:
+    """Human-readable IST label: ``06 Jun 2026, 15:29 IST``."""
+    if not iso_value:
+        return ""
+    try:
+        ts = datetime.fromisoformat(iso_value)
+        if ts.tzinfo is None:
+            # Legacy scans stored naive UTC on Streamlit Cloud.
+            ts = ts.replace(tzinfo=timezone.utc).astimezone(IST)
+        else:
+            ts = ts.astimezone(IST)
+        return ts.strftime("%d %b %Y, %H:%M IST")
+    except ValueError:
+        return iso_value
+
+
 def _run_scan(cfg: ScannerConfig) -> dict[str, Any]:
     hits, label, missing, errors, frame_cache, n50_set = run_eod_swing_scan(cfg)
     return {
@@ -679,7 +702,7 @@ def _run_scan(cfg: ScannerConfig) -> dict[str, Any]:
         "period": cfg.period,
         "frame_cache": frame_cache,
         "n50_set": n50_set,
-        "updated_at": datetime.now().isoformat(),
+        "updated_at": _scan_timestamp_iso(),
         "use_realtime": cfg.use_realtime,
     }
 
@@ -691,7 +714,7 @@ def _refresh_scan_live(scan: dict[str, Any], cfg: ScannerConfig) -> dict[str, An
     out = dict(scan)
     out["raw_df"] = hits_to_dataframe(hits)
     out["match_count"] = len(hits)
-    out["updated_at"] = datetime.now().isoformat()
+    out["updated_at"] = _scan_timestamp_iso()
     return out
 
 
@@ -739,7 +762,11 @@ def main() -> None:
         if updated:
             try:
                 ts = datetime.fromisoformat(updated)
-                if datetime.now() - ts >= timedelta(seconds=refresh_sec):
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc).astimezone(IST)
+                else:
+                    ts = ts.astimezone(IST)
+                if ist_now() - ts >= timedelta(seconds=refresh_sec):
                     st.session_state["eod_scan"] = _refresh_scan_live(scan, cfg)
                     st.rerun()
             except ValueError:
@@ -775,20 +802,14 @@ def main() -> None:
     display_df = _prepare_display_df(raw_df)
 
     mode_label = "Live LTP" if scan.get("use_realtime") else "EOD"
-    updated = scan.get("updated_at", "")
-    updated_short = ""
-    if updated:
-        try:
-            updated_short = datetime.fromisoformat(updated).strftime("%H:%M:%S")
-        except ValueError:
-            updated_short = updated
+    updated_label = _format_updated_at(scan.get("updated_at", ""))
 
     m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric("Matches", scan["match_count"])
     m2.metric("Mode", mode_label)
     m3.metric("Universe", scan["label"])
     m4.metric("Missing data", len(scan["missing"]))
-    m5.metric("Updated", updated_short or "—")
+    m5.metric("Updated (IST)", updated_label or "—")
     if scan["errors"]:
         st.caption(f"Download errors: {len(scan['errors'])}")
 
