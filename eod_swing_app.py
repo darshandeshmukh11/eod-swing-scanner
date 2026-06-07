@@ -23,6 +23,7 @@ from plotly.subplots import make_subplots
 from eod_swing_lib import (
     IST,
     compute_ema,
+    compute_supertrend,
     download_daily_single,
     fetch_live_quote,
     ist_now,
@@ -80,7 +81,7 @@ def _inject_dark_theme() -> None:
 
 def _sidebar_config() -> ScannerConfig:
     st.sidebar.header("Scanner filters")
-    st.sidebar.caption("All three core filters must pass: trend · volume · RSI")
+    st.sidebar.caption("Core: trend · volume · RSI · quality score")
 
     nifty50_only = st.sidebar.checkbox("NIFTY 50 only", value=False)
     prefer_live = st.sidebar.checkbox("Live symbol list (Wikipedia)", value=True)
@@ -90,6 +91,44 @@ def _sidebar_config() -> ScannerConfig:
     min_rsi = st.sidebar.slider("Min RSI(14)", 50, 75, 55)
     near_ema_pct = st.sidebar.slider("Near 20 EMA (%)", 0.5, 5.0, 2.0, 0.25)
     near_support_pct = st.sidebar.slider("Near support (%)", 1.0, 8.0, 3.5, 0.25)
+
+    st.sidebar.subheader("SuperTrend")
+    require_st = st.sidebar.checkbox(
+        "Require bullish SuperTrend",
+        value=True,
+        help="Close above SuperTrend line with bullish direction.",
+    )
+    st_atr = st.sidebar.slider("ST ATR period", 7, 14, 10)
+    st_mult = st.sidebar.slider("ST multiplier", 2.0, 4.0, 3.0, 0.5)
+
+    st.sidebar.subheader("Quality / leading signals")
+    min_quality = st.sidebar.slider(
+        "Min quality score (0–6)",
+        0,
+        6,
+        2,
+        help="Count of: ST bull, MACD bull, MACD rising, RSI rising, ST flip, ADX trend.",
+    )
+    require_macd = st.sidebar.checkbox("Require MACD bullish", value=False)
+    require_macd_hist = st.sidebar.checkbox(
+        "Require MACD histogram rising",
+        value=False,
+        help="Leading: MACD momentum turning up vs prior bar.",
+    )
+    require_rsi_rise = st.sidebar.checkbox(
+        "Require RSI rising",
+        value=False,
+        help="Leading: RSI higher than N bars ago.",
+    )
+    rsi_rise_bars = st.sidebar.slider("RSI rising lookback (bars)", 3, 10, 5, disabled=not require_rsi_rise)
+    require_st_flip = st.sidebar.checkbox(
+        "Require recent ST bullish flip",
+        value=False,
+        help="Leading: SuperTrend turned bullish within lookback window.",
+    )
+    st_flip_lb = st.sidebar.slider("ST flip lookback (bars)", 3, 10, 5, disabled=not require_st_flip)
+    require_adx = st.sidebar.checkbox("Require ADX trend strength", value=False)
+    min_adx = st.sidebar.slider("Min ADX", 15.0, 35.0, 20.0, 1.0, disabled=not require_adx)
 
     st.sidebar.subheader("Realtime")
     use_realtime = st.sidebar.checkbox(
@@ -119,6 +158,18 @@ def _sidebar_config() -> ScannerConfig:
         prefer_live_symbols=prefer_live,
         nifty50_only=nifty50_only,
         use_realtime=use_realtime,
+        require_supertrend=require_st,
+        st_atr_period=int(st_atr),
+        st_multiplier=float(st_mult),
+        min_quality_score=int(min_quality),
+        require_macd_bullish=require_macd,
+        require_macd_hist_rising=require_macd_hist,
+        require_rsi_rising=require_rsi_rise,
+        rsi_rising_bars=int(rsi_rise_bars),
+        require_st_flip=require_st_flip,
+        st_flip_lookback=int(st_flip_lb),
+        require_adx_trend=require_adx,
+        min_adx=float(min_adx),
     ), auto_refresh, refresh_sec
 
 
@@ -148,6 +199,12 @@ def _prepare_display_df(raw: pd.DataFrame) -> pd.DataFrame:
     out["Near EMA"] = out["near_ema"].map({True: "Yes", False: "—"})
     out["Near Support"] = out["near_support"].map({True: "Yes", False: "—"})
     out["Breakout"] = out["breakout_resistance"].map({True: "Yes", False: "—"})
+    if "quality_score" in out.columns:
+        out["Quality"] = out["quality_score"]
+    if "supertrend" in out.columns:
+        out["SuperTrend"] = out["supertrend"]
+    if "quality_flags" in out.columns:
+        out["Quality signals"] = out["quality_flags"].fillna("—")
 
     return out.rename(
         columns={
@@ -157,6 +214,7 @@ def _prepare_display_df(raw: pd.DataFrame) -> pd.DataFrame:
             "close": "Close",
             "pivot": "Pivot",
             "rsi": "RSI",
+            "adx": "ADX",
             "vol_vs_avg_pct": "Vol vs avg %",
             "support": "Support",
             "resistance": "Resistance",
@@ -168,16 +226,20 @@ def _prepare_display_df(raw: pd.DataFrame) -> pd.DataFrame:
 DISPLAY_COLS = [
     "Symbol",
     "Universe",
+    "Quality",
+    "Quality signals",
     "Close",
     "Suggested entry",
     "Entry zone",
     "Entry style",
     "Pivot",
+    "SuperTrend",
     "Stop (S1)",
     "Stop (S2)",
     "Target (R1)",
     "Target (R2)",
     "RSI",
+    "ADX",
     "Vol vs avg %",
     "Support",
     "Resistance",
@@ -197,6 +259,7 @@ def _style_results_table(df: pd.DataFrame):
         "Close",
         "Suggested entry",
         "Pivot",
+        "SuperTrend",
         *stop_cols,
         *target_cols,
         "Support",
@@ -310,6 +373,9 @@ def _render_stock_detail(
         st.success("Context flags: " + " · ".join(flags))
     if row.get("Patterns") and row["Patterns"] != "—":
         st.info(f"Candlestick: **{row['Patterns']}**")
+    if row.get("Quality signals") and row["Quality signals"] != "—":
+        q = row.get("Quality", "—")
+        st.success(f"Quality score **{q}/6** · {row['Quality signals']}")
 
     _render_daily_chart(str(row["Symbol"]), period, row, raw_row, use_live=use_live)
 
@@ -402,6 +468,7 @@ def build_daily_swing_chart(
     close = chart["Close"].astype(float)
     ema20 = compute_ema(close, 20)
     ema50 = compute_ema(close, 50)
+    st_df = compute_supertrend(chart, period=10, multiplier=3.0)
 
     entry = float(display_row["Suggested entry"]) if pd.notna(display_row.get("Suggested entry")) else None
     entry_low = float(raw_row["entry_low"]) if pd.notna(raw_row.get("entry_low")) else None
@@ -456,6 +523,20 @@ def build_daily_swing_chart(
             mode="lines",
             name="EMA 50",
             line=dict(color="#fbbf24", width=1.5),
+        ),
+        row=1,
+        col=1,
+    )
+    st_colors = ["#22c55e" if d == 1 else "#ef4444" for d in st_df["direction"]]
+    fig.add_trace(
+        go.Scatter(
+            x=chart.index,
+            y=st_df["supertrend"],
+            mode="lines",
+            name="SuperTrend",
+            line=dict(color="#a78bfa", width=1.8),
+            customdata=st_colors,
+            hovertemplate="SuperTrend %{y:,.2f}<extra></extra>",
         ),
         row=1,
         col=1,
@@ -816,6 +897,7 @@ def main() -> None:
 - Close above 20 EMA and 20 EMA above 50 EMA
 - Session volume above 20-day average
 - RSI(14) above your minimum
+- **SuperTrend** bullish (optional) + **quality score** from MACD / RSI slope / ST flip / ADX
 
 **Pivot columns** help you set stop loss (S1/S2) and targets (R1/R2) for the next session.
 **Suggested entry** is a dip-buy zone (S1 / pivot / 20 EMA) or breakout above resistance.

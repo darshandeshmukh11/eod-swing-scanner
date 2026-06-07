@@ -6,6 +6,7 @@ Hard filters (all required):
   1. Close > 20 EMA and 20 EMA > 50 EMA
   2. Session volume > 20-day average volume
   3. RSI(14) > 55
+  4. SuperTrend bullish (default on) + min quality score (MACD / RSI slope / ST flip / ADX)
 
 Context flags (reported, not required):
   - Near 20 EMA (within tolerance)
@@ -30,12 +31,16 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
+import numpy as np
 import pandas as pd
 
 from eod_swing_lib import (
     LiveQuote,
+    compute_adx,
     compute_ema,
+    compute_macd,
     compute_rsi,
+    compute_supertrend,
     detect_marubozu,
     download_daily_batch,
     download_daily_single,
@@ -45,6 +50,7 @@ from eod_swing_lib import (
     infer_support_resistance,
     merge_realtime_session,
     session_bar_indices,
+    supertrend_flip_bars_ago,
     to_yahoo_nse,
 )
 
@@ -68,6 +74,20 @@ class ScannerConfig:
     nifty50_only: bool = False
     use_realtime: bool = False
     live_quote_workers: int = 10
+    # SuperTrend confirmation (trend filter)
+    require_supertrend: bool = True
+    st_atr_period: int = 10
+    st_multiplier: float = 3.0
+    # Leading / quality signals (MACD momentum, RSI slope, fresh ST flip, ADX)
+    min_quality_score: int = 2
+    require_macd_bullish: bool = False
+    require_rsi_rising: bool = False
+    rsi_rising_bars: int = 5
+    require_macd_hist_rising: bool = False
+    require_st_flip: bool = False
+    st_flip_lookback: int = 5
+    require_adx_trend: bool = False
+    min_adx: float = 20.0
 
 
 @dataclass
@@ -95,6 +115,104 @@ class ScanHit:
     as_of: str = ""
     live_ltp: Optional[float] = None
     scan_mode: str = "eod"
+    supertrend: Optional[float] = None
+    st_bullish: bool = False
+    st_flip_bars: Optional[int] = None
+    macd_bullish: bool = False
+    macd_hist_rising: bool = False
+    rsi_rising: bool = False
+    adx: Optional[float] = None
+    adx_strong: bool = False
+    quality_score: int = 0
+    quality_flags: list[str] = field(default_factory=list)
+
+
+def _evaluate_quality_signals(
+    work: pd.DataFrame,
+    close_s: pd.Series,
+    price_idx: int,
+    price: float,
+    rsi_series: pd.Series,
+    cfg: ScannerConfig,
+) -> Optional[dict[str, object]]:
+    """SuperTrend + leading quality flags at ``price_idx``. Returns None if hard filters fail."""
+    st_df = compute_supertrend(work, cfg.st_atr_period, cfg.st_multiplier)
+    st_raw = st_df["supertrend"].iloc[price_idx]
+    st_dir = int(st_df["direction"].iloc[price_idx])
+    if pd.isna(st_raw):
+        if cfg.require_supertrend:
+            return None
+        st_val = price
+        st_bullish = False
+    else:
+        st_val = float(st_raw)
+        st_bullish = st_dir == 1 and price > st_val
+        if cfg.require_supertrend and not st_bullish:
+            return None
+
+    macd_df = compute_macd(close_s)
+    macd_line = float(macd_df["macd"].iloc[price_idx])
+    macd_sig = float(macd_df["signal"].iloc[price_idx])
+    macd_hist = float(macd_df["histogram"].iloc[price_idx])
+    macd_bullish = macd_line > macd_sig
+    macd_hist_rising = False
+    if price_idx >= 1:
+        prev_hist = float(macd_df["histogram"].iloc[price_idx - 1])
+        macd_hist_rising = macd_hist > prev_hist
+
+    rsi_now = float(rsi_series.iloc[price_idx])
+    rsi_rising = False
+    lookback = max(1, cfg.rsi_rising_bars)
+    if price_idx >= lookback:
+        rsi_rising = rsi_now > float(rsi_series.iloc[price_idx - lookback])
+
+    st_flip = supertrend_flip_bars_ago(st_df["direction"], price_idx, cfg.st_flip_lookback)
+    st_flip_recent = st_flip is not None
+
+    adx_series = compute_adx(work, 14)
+    adx_val = float(adx_series.iloc[price_idx]) if not np.isnan(adx_series.iloc[price_idx]) else 0.0
+    adx_strong = adx_val >= cfg.min_adx
+
+    if cfg.require_macd_bullish and not macd_bullish:
+        return None
+    if cfg.require_macd_hist_rising and not macd_hist_rising:
+        return None
+    if cfg.require_rsi_rising and not rsi_rising:
+        return None
+    if cfg.require_st_flip and not st_flip_recent:
+        return None
+    if cfg.require_adx_trend and not adx_strong:
+        return None
+
+    flags: list[str] = []
+    score = 0
+    for ok, name in (
+        (st_bullish, "ST bull"),
+        (macd_bullish, "MACD bull"),
+        (macd_hist_rising, "MACD rising"),
+        (rsi_rising, "RSI rising"),
+        (st_flip_recent, "ST flip"),
+        (adx_strong, "ADX trend"),
+    ):
+        if ok:
+            score += 1
+            flags.append(name)
+
+    if score < cfg.min_quality_score:
+        return None
+
+    return {
+        "supertrend": round(st_val, 2),
+        "st_bullish": st_bullish,
+        "st_flip_bars": st_flip,
+        "macd_bullish": macd_bullish,
+        "macd_hist_rising": macd_hist_rising,
+        "rsi_rising": rsi_rising,
+        "adx": round(adx_val, 1),
+        "adx_strong": adx_strong,
+        "quality_score": score,
+        "quality_flags": flags,
+    }
 
 
 def _is_hammer_bar(o: float, h: float, low: float, c: float) -> bool:
@@ -198,6 +316,7 @@ def evaluate_symbol(
     )
 
     close_s = work["Close"].astype(float)
+    rsi_series = compute_rsi(close_s, cfg.rsi_period)
     price = live_ltp if live_ltp is not None else float(close_s.iloc[price_idx])
     ema20 = float(compute_ema(close_s, cfg.ema_fast).iloc[price_idx])
     ema50 = float(compute_ema(close_s, cfg.ema_slow).iloc[price_idx])
@@ -205,7 +324,7 @@ def evaluate_symbol(
     if not (price > ema20 > ema50):
         return None
 
-    rsi = float(compute_rsi(close_s, cfg.rsi_period).iloc[price_idx])
+    rsi = float(rsi_series.iloc[price_idx])
     if rsi <= cfg.min_rsi:
         return None
 
@@ -213,6 +332,10 @@ def evaluate_symbol(
     avg_vol = float(vol.rolling(cfg.volume_ma_period).mean().iloc[vol_idx])
     last_vol = float(vol.iloc[vol_idx])
     if avg_vol <= 0 or last_vol <= avg_vol:
+        return None
+
+    quality = _evaluate_quality_signals(work, close_s, price_idx, price, rsi_series, cfg)
+    if quality is None:
         return None
 
     support, resistance, _ = infer_support_resistance(work, price, cfg.sr_lookback_days)
@@ -256,6 +379,16 @@ def evaluate_symbol(
         as_of=as_of,
         live_ltp=live_ltp,
         scan_mode=scan_mode,
+        supertrend=quality["supertrend"],
+        st_bullish=quality["st_bullish"],
+        st_flip_bars=quality["st_flip_bars"],
+        macd_bullish=quality["macd_bullish"],
+        macd_hist_rising=quality["macd_hist_rising"],
+        rsi_rising=quality["rsi_rising"],
+        adx=quality["adx"],
+        adx_strong=quality["adx_strong"],
+        quality_score=quality["quality_score"],
+        quality_flags=quality["quality_flags"],
     )
 
 
@@ -288,7 +421,10 @@ def reevaluate_hits_from_cache(
         )
         if hit is not None:
             hits.append(hit)
-    hits.sort(key=lambda h: (len(h.patterns), h.rsi, h.vol_vs_avg_pct), reverse=True)
+    hits.sort(
+        key=lambda h: (h.quality_score, len(h.patterns), h.rsi, h.vol_vs_avg_pct),
+        reverse=True,
+    )
     return hits
 
 
@@ -346,7 +482,10 @@ def _scan_universe(
         if i + cfg.batch_size < len(yahoo_tickers) and cfg.download_delay > 0:
             time.sleep(cfg.download_delay)
 
-    hits.sort(key=lambda h: (len(h.patterns), h.rsi, h.vol_vs_avg_pct), reverse=True)
+    hits.sort(
+        key=lambda h: (h.quality_score, len(h.patterns), h.rsi, h.vol_vs_avg_pct),
+        reverse=True,
+    )
     return hits, missing, errors, frame_cache
 
 
@@ -473,6 +612,16 @@ def hits_to_dataframe(hits: list[ScanHit]) -> pd.DataFrame:
                 "entry_style": entry.entry_style,
                 "entry_note": entry.note,
                 "patterns": ", ".join(h.patterns) if h.patterns else "—",
+                "supertrend": h.supertrend,
+                "st_bullish": h.st_bullish,
+                "st_flip_bars": h.st_flip_bars,
+                "macd_bullish": h.macd_bullish,
+                "macd_hist_rising": h.macd_hist_rising,
+                "rsi_rising": h.rsi_rising,
+                "adx": h.adx,
+                "adx_strong": h.adx_strong,
+                "quality_score": h.quality_score,
+                "quality_flags": ", ".join(h.quality_flags) if h.quality_flags else "—",
             }
         )
     return pd.DataFrame(rows)

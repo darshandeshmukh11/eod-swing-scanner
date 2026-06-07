@@ -40,6 +40,8 @@ def format_hit_block(hit: ScanHit, index: int) -> str:
         f"<b>{index}. {html_escape(hit.symbol)}</b> "
         f"({html_escape(hit.universe)})\n"
         f"Close <b>{hit.close}</b> | RSI <b>{hit.rsi}</b> | Vol +{hit.vol_vs_avg_pct}%\n"
+        f"Quality <b>{hit.quality_score}/6</b> | ST {hit.supertrend} | ADX {hit.adx}\n"
+        f"Signals: {html_escape(', '.join(hit.quality_flags) if hit.quality_flags else '—')}\n"
         f"EMA20 {hit.ema20} | EMA50 {hit.ema50}\n"
         f"<b>Pivots:</b> S1 {hit.s1} | S2 {hit.s2} | R1 {hit.r1} | R2 {hit.r2}\n"
         f"Near EMA {_yn(hit.near_ema)} | Near Sup {_yn(hit.near_support)} | "
@@ -63,7 +65,7 @@ def format_swing_scan_telegram(
         f"<i>Next session ideas · scanned {html_escape(scanned_label)}</i>\n"
         f"Bar date: <b>{html_escape(as_of)}</b> | "
         f"Sent {ist.strftime('%Y-%m-%d %H:%M')} IST\n"
-        f"Filters: Close&gt;20EMA&gt;50EMA · RSI&gt;55 · Vol&gt;avg\n"
+        f"Filters: trend · vol · RSI · ST · quality score\n"
         f"Matches: <b>{len(hits)}</b>\n"
     )
 

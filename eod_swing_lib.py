@@ -284,14 +284,135 @@ def compute_rsi(close: pd.Series, period: int = 14) -> pd.Series:
     return 100 - (100 / (1 + rs))
 
 
-def compute_atr(df: pd.DataFrame, period: int = 14) -> float:
+def compute_atr_series(df: pd.DataFrame, period: int = 14) -> pd.Series:
     high_low = df["High"] - df["Low"]
     high_close = (df["High"] - df["Close"].shift(1)).abs()
     low_close = (df["Low"] - df["Close"].shift(1)).abs()
     true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    atr = true_range.rolling(period).mean()
+    return true_range.rolling(period).mean()
+
+
+def compute_atr(df: pd.DataFrame, period: int = 14) -> float:
+    atr = compute_atr_series(df, period)
     val = float(atr.iloc[-1]) if len(atr) and not np.isnan(atr.iloc[-1]) else np.nan
     return val
+
+
+def compute_macd(
+    close: pd.Series,
+    fast: int = 12,
+    slow: int = 26,
+    signal: int = 9,
+) -> pd.DataFrame:
+    """MACD line, signal line, and histogram."""
+    macd_line = compute_ema(close, fast) - compute_ema(close, slow)
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    histogram = macd_line - signal_line
+    return pd.DataFrame(
+        {"macd": macd_line, "signal": signal_line, "histogram": histogram},
+        index=close.index,
+    )
+
+
+def compute_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """Average Directional Index (trend strength)."""
+    high = df["High"].astype(float)
+    low = df["Low"].astype(float)
+    close = df["Close"].astype(float)
+    up_move = high.diff()
+    down_move = -low.diff()
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+    tr = compute_atr_series(df, period)
+    atr = tr.replace(0, np.nan)
+    plus_di = 100 * pd.Series(plus_dm, index=df.index).ewm(alpha=1 / period, adjust=False).mean() / atr
+    minus_di = 100 * pd.Series(minus_dm, index=df.index).ewm(alpha=1 / period, adjust=False).mean() / atr
+    dx = (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan) * 100
+    return dx.ewm(alpha=1 / period, adjust=False).mean()
+
+
+def compute_supertrend(
+    df: pd.DataFrame,
+    period: int = 10,
+    multiplier: float = 3.0,
+) -> pd.DataFrame:
+    """
+    SuperTrend bands. ``direction``: 1 = bullish (line below price), -1 = bearish.
+    """
+    if df.empty:
+        return pd.DataFrame(columns=["supertrend", "direction"])
+
+    high = df["High"].astype(float)
+    low = df["Low"].astype(float)
+    close = df["Close"].astype(float)
+    atr = compute_atr_series(df, period)
+    hl2 = (high + low) / 2.0
+    basic_upper = hl2 + multiplier * atr
+    basic_lower = hl2 - multiplier * atr
+
+    n = len(df)
+    final_upper = np.full(n, np.nan)
+    final_lower = np.full(n, np.nan)
+    supertrend = np.full(n, np.nan)
+    direction = np.ones(n, dtype=int)
+
+    final_upper[0] = basic_upper.iloc[0]
+    final_lower[0] = basic_lower.iloc[0]
+    supertrend[0] = final_lower[0]
+    direction[0] = 1
+
+    for i in range(1, n):
+        if np.isnan(atr.iloc[i]):
+            final_upper[i] = basic_upper.iloc[i]
+            final_lower[i] = basic_lower.iloc[i]
+            supertrend[i] = supertrend[i - 1]
+            direction[i] = direction[i - 1]
+            continue
+
+        bu = float(basic_upper.iloc[i])
+        bl = float(basic_lower.iloc[i])
+        c = float(close.iloc[i])
+        c_prev = float(close.iloc[i - 1])
+
+        if bu < final_upper[i - 1] or c_prev > final_upper[i - 1]:
+            final_upper[i] = bu
+        else:
+            final_upper[i] = final_upper[i - 1]
+
+        if bl > final_lower[i - 1] or c_prev < final_lower[i - 1]:
+            final_lower[i] = bl
+        else:
+            final_lower[i] = final_lower[i - 1]
+
+        if direction[i - 1] == 1:
+            if c < final_lower[i]:
+                direction[i] = -1
+                supertrend[i] = final_upper[i]
+            else:
+                direction[i] = 1
+                supertrend[i] = final_lower[i]
+        elif c > final_upper[i]:
+            direction[i] = 1
+            supertrend[i] = final_lower[i]
+        else:
+            direction[i] = -1
+            supertrend[i] = final_upper[i]
+
+    return pd.DataFrame(
+        {"supertrend": supertrend, "direction": direction},
+        index=df.index,
+    )
+
+
+def supertrend_flip_bars_ago(direction: pd.Series, idx: int, lookback: int = 5) -> Optional[int]:
+    """Bars since last bullish flip (1), or None if no flip within lookback."""
+    if idx < 1 or lookback < 1:
+        return None
+    start = max(1, idx - lookback + 1)
+    for i in range(idx, start - 1, -1):
+        if direction.iloc[i] == 1 and direction.iloc[i - 1] == -1:
+            return idx - i
+    return None
 
 
 def find_swing_points(df: pd.DataFrame, lookback: int = 3) -> tuple[list[float], list[float]]:
