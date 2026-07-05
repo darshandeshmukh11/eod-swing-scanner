@@ -1,0 +1,198 @@
+project:
+  name: eod-swing
+  purpose: "End-of-day / live-LTP swing scanner for NSE stocks."
+  primary_entrypoints:
+    streamlit_app: eod_swing_app.py
+    cli_scanner: eod_swing_scanner.py
+    telegram_alerts: eod_swing_telegram.py
+  primary_scanner: eod_swing_scanner.py
+
+data:
+  source: yfinance
+  interval: "1d"
+  default_history_period: "1y"
+  app_history_options: ["6mo", "1y", "2y"]
+  default_universe: "NIFTY 50 + NIFTY 100"
+  universe_options:
+    - "NIFTY 50 + NIFTY 100"
+    - "NIFTY 50 only"
+  realtime_mode:
+    app_default: true
+    cli_default: false
+    behavior: "When enabled, live LTP is merged into the latest daily bar for trend, RSI, pivots, support/resistance, and entry planning."
+    volume_note: "Volume uses the selected session volume if available; otherwise the scanner falls back to the last completed session."
+
+scan_defaults:
+  min_history_bars: 60
+  batch_size: 12
+  download_delay_seconds: 0.12
+  prefer_live_symbols: true
+  live_quote_workers: 10
+
+hard_filters:
+  description: "A stock must pass every hard filter to become a scan hit / potential buy idea."
+  trend:
+    formula: "price > EMA(20) > EMA(50)"
+    ema_fast: 20
+    ema_slow: 50
+    source_function: "evaluate_symbol"
+  momentum:
+    indicator: "RSI"
+    period: 14
+    default_threshold: 55.0
+    rule: "RSI(14) > min_rsi"
+    app_slider_range: [50, 75]
+  volume:
+    average_period: 20
+    rule: "session_volume > SMA(Volume, 20)"
+  supertrend:
+    required_by_default: true
+    atr_period: 10
+    multiplier: 3.0
+    rule: "SuperTrend direction is bullish and price is above the SuperTrend line."
+  quality_score:
+    default_minimum: 2
+    max_score: 6
+    rule: "quality_score >= min_quality_score"
+    counted_flags:
+      - id: st_bull
+        label: "ST bull"
+        condition: "SuperTrend is bullish."
+      - id: macd_bull
+        label: "MACD bull"
+        condition: "MACD line > MACD signal line."
+      - id: macd_rising
+        label: "MACD rising"
+        condition: "Current MACD histogram > previous MACD histogram."
+      - id: rsi_rising
+        label: "RSI rising"
+        condition: "Current RSI > RSI from rsi_rising_bars ago."
+        default_lookback_bars: 5
+      - id: st_flip
+        label: "ST flip"
+        condition: "SuperTrend flipped bullish within st_flip_lookback bars."
+        default_lookback_bars: 5
+      - id: adx_trend
+        label: "ADX trend"
+        condition: "ADX(14) >= min_adx."
+        default_min_adx: 20.0
+
+optional_required_quality_toggles:
+  description: "These are off by default. If enabled, each becomes an additional hard filter."
+  require_macd_bullish:
+    default: false
+    rule: "MACD line > MACD signal line"
+  require_macd_hist_rising:
+    default: false
+    rule: "MACD histogram is rising versus the previous bar"
+  require_rsi_rising:
+    default: false
+    default_lookback_bars: 5
+    rule: "RSI is higher than it was N bars ago"
+  require_st_flip:
+    default: false
+    default_lookback_bars: 5
+    rule: "Recent bullish SuperTrend flip"
+  require_adx_trend:
+    default: false
+    default_min_adx: 20.0
+    rule: "ADX(14) >= min_adx"
+
+context_flags:
+  description: "Reported in output and charts, but not required for a hit unless future code changes make them hard filters."
+  near_ema:
+    default_threshold_pct: 2.0
+    formula: "abs(price - EMA20) / EMA20 * 100 <= near_ema_pct"
+  near_support:
+    default_threshold_pct: 3.5
+    formula: "(price - nearest_support) / price * 100 <= near_support_pct"
+  breakout_resistance:
+    default_buffer_pct: 0.15
+    formula: "price > nearest_resistance * (1 + breakout_buffer_pct / 100) and previous_close <= nearest_resistance"
+  candlestick_patterns:
+    evaluated_on: "latest completed daily bar"
+    patterns:
+      - hammer
+      - bullish_engulfing
+      - marubozu
+
+support_resistance:
+  source_function: "infer_support_resistance"
+  lookback_days_default: 120
+  swing_point_lookback: 3
+  atr_period: 14
+  clustering_tolerance: "max(ATR(14) * 0.35, current_price * 0.004)"
+  support_candidates: "clustered swing lows plus previous-session pivot levels below current price"
+  resistance_candidates: "clustered swing highs plus previous-session pivot levels above current price"
+  fallback_support: "current_price * 0.95"
+  fallback_resistance: "current_price * 1.08"
+
+pivots:
+  source_function: "immediate_floor_pivots"
+  purpose: "Next-session stop and target levels shown as Pivot, S1, S2, R1, and R2."
+  input_bar: "The scanned session bar at price_idx. In realtime mode this can include live LTP merged into today's daily bar."
+  formulas:
+    pivot: "(High + Low + Close) / 3"
+    r1: "2 * Pivot - Low"
+    s1: "2 * Pivot - High"
+    r2: "Pivot + (High - Low)"
+    s2: "Pivot - (High - Low)"
+  output_order:
+    - pivot
+    - s1
+    - s2
+    - r1
+    - r2
+  app_labels:
+    s1: "Stop (S1), tighter stop"
+    s2: "Stop (S2), wider stop"
+    r1: "Target (R1), first target"
+    r2: "Target (R2), stretch target"
+
+entry_and_zones:
+  suggested_entry_source: "suggest_swing_entry"
+  chart_zone_source: "_compute_buy_sell_zones"
+  breakout_entry:
+    trigger: "breakout_resistance is true"
+    suggested_entry_formula: "nearest_resistance * 1.0015"
+    entry_low: "nearest_resistance"
+    entry_high: "suggested_entry"
+    chart_buy_zone_low: "min(nearest_resistance, suggested_entry)"
+    chart_buy_zone_high: "max(nearest_resistance * 1.001, suggested_entry)"
+    note: "Enter on hold above resistance with volume."
+  dip_entry:
+    trigger: "default when breakout_resistance is false"
+    entry_primary_formula: "max(S1, nearest_support, Pivot * 0.998)"
+    entry_secondary_formula: "min(EMA20, (S1 + Pivot) / 2)"
+    entry_secondary_adjustment: "If entry_secondary > current price, use EMA20 * 0.995 instead."
+    suggested_entry_formula: "(entry_primary + entry_secondary) / 2"
+    suggested_entry_adjustment: "If suggested_entry > current price, use min(entry_primary, EMA20 * 0.998) and cap entry_high at current price."
+    entry_low: "min(entry_primary, entry_secondary)"
+    entry_high: "max(entry_primary, entry_secondary), with possible cap at current price"
+    chart_buy_zone: "[entry_low, entry_high]"
+  fallback_chart_buy_zone:
+    when: "Entry low/high are missing but S1, support, and pivot exist."
+    formula: "[min(S1, nearest_support, Pivot), max(S1, nearest_support, Pivot)]"
+  sell_zone:
+    formula: "[min(R1, R2), max(R1, R2)]"
+    labels:
+      target_1: "R1"
+      target_2: "R2"
+
+sorting:
+  scan_hits: "Sorted descending by quality_score, number of candlestick patterns, RSI, then volume percentage above average."
+
+auxiliary_screeners:
+  filter_pipeline_py:
+    status: "Separate multi-stage pipeline; not the main app/Telegram buy scanner."
+    universe: "NIFTY 50"
+    stages:
+      - "Trend: price > EMA20 > EMA50 and optionally price > EMA200"
+      - "Momentum: RSI between 45 and 72; MACD histogram > 0 by default"
+      - "Volume: volume >= 1.1 * 20-day average volume"
+      - "Support/resistance: near support and enough room to resistance"
+      - "Candlestick confirmation"
+      - "Risk/reward: minimum 2.0 and stop distance <= 6%"
+  shortlist_screener:
+    status: "Quick NIFTY 50 screener in filter_pipeline.py."
+    rule: "Close > EMA20, RSI(14) > 55, volume > 20-day average."
