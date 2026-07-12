@@ -8,11 +8,12 @@ modules required at import time.
 
 from __future__ import annotations
 
+import time as time_mod
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, time
 from functools import lru_cache
-from typing import Optional
+from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -25,26 +26,43 @@ NSE_MARKET_OPEN = time(9, 15)
 NSE_MARKET_CLOSE = time(15, 30)
 
 _OHLCV_COLS = ("Open", "High", "Low", "Close", "Volume")
+_YF_DOWNLOAD_RETRIES = 3
+_YF_RETRY_SLEEP_SEC = 1.5
+
+
+def _yf_major_version() -> int:
+    try:
+        return int(str(getattr(yf, "__version__", "0")).split(".")[0])
+    except (TypeError, ValueError):
+        return 0
 
 
 @lru_cache(maxsize=1)
 def _yf_session() -> requests.Session:
     """
-    Plain requests session for Yahoo Finance.
+    Plain requests session for Yahoo Finance on yfinance 0.2.x.
 
-    Newer yfinance defaults to curl_cffi, which Segmentation-faults on
-    Streamlit Community Cloud (seen as crash in /app/scripts/run-streamlit.sh).
+    yfinance >= 1.0 requires curl_cffi and rejects requests.Session.
+    On Streamlit Cloud, pin yfinance==0.2.40 (see requirements.txt) so this
+    path is used and curl_cffi segfaults are avoided.
     """
     session = requests.Session()
     session.headers.update(
         {
             "User-Agent": (
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
             )
         }
     )
     return session
+
+
+def _yf_session_kwargs() -> dict[str, Any]:
+    """Only inject a requests session on yfinance 0.x."""
+    if _yf_major_version() >= 1:
+        return {}
+    return {"session": _yf_session()}
 
 # --- NIFTY symbol lists -------------------------------------------------------
 
@@ -256,21 +274,9 @@ def _extract_ticker_frame(data: pd.DataFrame, ticker: str) -> pd.DataFrame:
     return pd.DataFrame()
 
 
-def download_daily_batch(yahoo_tickers: list[str], period: str) -> dict[str, pd.DataFrame]:
-    if not yahoo_tickers:
-        return {}
-    raw = yf.download(
-        yahoo_tickers,
-        period=period,
-        interval="1d",
-        group_by="ticker",
-        auto_adjust=False,
-        progress=False,
-        threads=False,
-        session=_yf_session(),
-    )
+def _parse_batch_frames(raw: pd.DataFrame, yahoo_tickers: list[str]) -> dict[str, pd.DataFrame]:
     out: dict[str, pd.DataFrame] = {}
-    if raw.empty:
+    if raw is None or raw.empty:
         return out
     if len(yahoo_tickers) == 1:
         frame = _extract_ticker_frame(raw, yahoo_tickers[0])
@@ -286,19 +292,56 @@ def download_daily_batch(yahoo_tickers: list[str], period: str) -> dict[str, pd.
     return out
 
 
+def download_daily_batch(yahoo_tickers: list[str], period: str) -> dict[str, pd.DataFrame]:
+    if not yahoo_tickers:
+        return {}
+    session_kw = _yf_session_kwargs()
+    out: dict[str, pd.DataFrame] = {}
+    for attempt in range(_YF_DOWNLOAD_RETRIES):
+        try:
+            raw = yf.download(
+                yahoo_tickers,
+                period=period,
+                interval="1d",
+                group_by="ticker",
+                auto_adjust=False,
+                progress=False,
+                threads=False,
+                **session_kw,
+            )
+        except Exception:
+            raw = pd.DataFrame()
+        out = _parse_batch_frames(raw, yahoo_tickers)
+        if len(out) >= max(1, len(yahoo_tickers) // 2):
+            return out
+        if attempt + 1 < _YF_DOWNLOAD_RETRIES:
+            time_mod.sleep(_YF_RETRY_SLEEP_SEC * (attempt + 1))
+    return out
+
+
 def download_daily_single(yahoo_ticker: str, period: str) -> pd.DataFrame:
-    df = yf.download(
-        yahoo_ticker,
-        period=period,
-        interval="1d",
-        auto_adjust=False,
-        progress=False,
-        threads=False,
-        session=_yf_session(),
-    )
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    return _trim_ohlcv(df).dropna()
+    session_kw = _yf_session_kwargs()
+    for attempt in range(_YF_DOWNLOAD_RETRIES):
+        try:
+            df = yf.download(
+                yahoo_ticker,
+                period=period,
+                interval="1d",
+                auto_adjust=False,
+                progress=False,
+                threads=False,
+                **session_kw,
+            )
+        except Exception:
+            df = pd.DataFrame()
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        trimmed = _trim_ohlcv(df).dropna()
+        if not trimmed.empty:
+            return trimmed
+        if attempt + 1 < _YF_DOWNLOAD_RETRIES:
+            time_mod.sleep(_YF_RETRY_SLEEP_SEC * (attempt + 1))
+    return pd.DataFrame()
 
 
 def compute_ema(close: pd.Series, period: int) -> pd.Series:
@@ -676,7 +719,7 @@ def fetch_live_quote(nse_symbol: str) -> Optional[LiveQuote]:
     """Latest LTP for an NSE symbol via Yahoo Finance."""
     yahoo = to_yahoo_nse(nse_symbol)
     try:
-        ticker = yf.Ticker(yahoo, session=_yf_session())
+        ticker = yf.Ticker(yahoo, **_yf_session_kwargs())
         price: Optional[float] = None
         day_high = 0.0
         day_low = 0.0
