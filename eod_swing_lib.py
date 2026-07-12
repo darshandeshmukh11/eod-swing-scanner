@@ -8,6 +8,7 @@ modules required at import time.
 
 from __future__ import annotations
 
+import logging
 import time as time_mod
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -26,8 +27,50 @@ NSE_MARKET_OPEN = time(9, 15)
 NSE_MARKET_CLOSE = time(15, 30)
 
 _OHLCV_COLS = ("Open", "High", "Low", "Close", "Volume")
-_YF_DOWNLOAD_RETRIES = 3
-_YF_RETRY_SLEEP_SEC = 1.5
+_YF_DOWNLOAD_RETRIES = 2
+_YF_RETRY_SLEEP_SEC = 1.25
+_YF_INTER_TICKER_SLEEP_SEC = 0.2
+_YF_CIRCUIT_FAILS = 4  # consecutive empty responses → stop hammering Yahoo
+
+# Yahoo returns empty bodies under rate pressure; yfinance logs that as JSONDecodeError.
+logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+
+
+class YahooDataUnavailable(RuntimeError):
+    """Raised when Yahoo Finance is blocked / rate-limited for this environment."""
+
+
+# Process-wide circuit: once tripped, skip further Yahoo calls until process restart.
+_yahoo_circuit_open = False
+_yahoo_consecutive_fails = 0
+
+
+def _yahoo_note_success() -> None:
+    global _yahoo_consecutive_fails
+    _yahoo_consecutive_fails = 0
+
+
+def _yahoo_note_failure() -> None:
+    global _yahoo_circuit_open, _yahoo_consecutive_fails
+    _yahoo_consecutive_fails += 1
+    if _yahoo_consecutive_fails >= _YF_CIRCUIT_FAILS:
+        _yahoo_circuit_open = True
+
+
+def reset_yahoo_circuit() -> None:
+    """Clear the Yahoo fail-fast latch (call at the start of a new scan)."""
+    global _yahoo_circuit_open, _yahoo_consecutive_fails
+    _yahoo_circuit_open = False
+    _yahoo_consecutive_fails = 0
+
+
+def _ensure_yahoo_circuit_closed() -> None:
+    if _yahoo_circuit_open:
+        raise YahooDataUnavailable(
+            "Yahoo Finance is blocking or rate-limiting this environment "
+            "(empty JSON responses). Stop the run, wait a minute, then retry "
+            "with Realtime OFF — or run the scanner locally instead of Streamlit Cloud."
+        )
 
 
 def _yf_major_version() -> int:
@@ -292,34 +335,23 @@ def _parse_batch_frames(raw: pd.DataFrame, yahoo_tickers: list[str]) -> dict[str
     return out
 
 
-def download_daily_batch(yahoo_tickers: list[str], period: str) -> dict[str, pd.DataFrame]:
-    if not yahoo_tickers:
-        return {}
-    session_kw = _yf_session_kwargs()
-    out: dict[str, pd.DataFrame] = {}
-    for attempt in range(_YF_DOWNLOAD_RETRIES):
-        try:
-            raw = yf.download(
-                yahoo_tickers,
-                period=period,
-                interval="1d",
-                group_by="ticker",
-                auto_adjust=False,
-                progress=False,
-                threads=False,
-                **session_kw,
-            )
-        except Exception:
-            raw = pd.DataFrame()
-        out = _parse_batch_frames(raw, yahoo_tickers)
-        if len(out) >= max(1, len(yahoo_tickers) // 2):
-            return out
-        if attempt + 1 < _YF_DOWNLOAD_RETRIES:
-            time_mod.sleep(_YF_RETRY_SLEEP_SEC * (attempt + 1))
-    return out
+def _history_fallback(yahoo_ticker: str, period: str) -> pd.DataFrame:
+    """Fallback when multi-ticker download returns empty JSON under rate limits."""
+    try:
+        hist = yf.Ticker(yahoo_ticker, **_yf_session_kwargs()).history(
+            period=period,
+            interval="1d",
+            auto_adjust=False,
+        )
+    except Exception:
+        return pd.DataFrame()
+    if hist is None or hist.empty:
+        return pd.DataFrame()
+    return _trim_ohlcv(hist).dropna()
 
 
 def download_daily_single(yahoo_ticker: str, period: str) -> pd.DataFrame:
+    _ensure_yahoo_circuit_closed()
     session_kw = _yf_session_kwargs()
     for attempt in range(_YF_DOWNLOAD_RETRIES):
         try:
@@ -334,14 +366,75 @@ def download_daily_single(yahoo_ticker: str, period: str) -> pd.DataFrame:
             )
         except Exception:
             df = pd.DataFrame()
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        trimmed = _trim_ohlcv(df).dropna()
-        if not trimmed.empty:
-            return trimmed
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            trimmed = _trim_ohlcv(df).dropna()
+            if not trimmed.empty:
+                _yahoo_note_success()
+                return trimmed
+
+        fallback = _history_fallback(yahoo_ticker, period)
+        if not fallback.empty:
+            _yahoo_note_success()
+            return fallback
+
         if attempt + 1 < _YF_DOWNLOAD_RETRIES:
             time_mod.sleep(_YF_RETRY_SLEEP_SEC * (attempt + 1))
+
+    _yahoo_note_failure()
+    _ensure_yahoo_circuit_closed()
     return pd.DataFrame()
+
+
+def download_daily_batch(yahoo_tickers: list[str], period: str) -> dict[str, pd.DataFrame]:
+    if not yahoo_tickers:
+        return {}
+    _ensure_yahoo_circuit_closed()
+    session_kw = _yf_session_kwargs()
+    out: dict[str, pd.DataFrame] = {}
+
+    try:
+        raw = yf.download(
+            yahoo_tickers,
+            period=period,
+            interval="1d",
+            group_by="ticker",
+            auto_adjust=False,
+            progress=False,
+            threads=False,
+            **session_kw,
+        )
+    except Exception:
+        raw = pd.DataFrame()
+    out = _parse_batch_frames(raw, yahoo_tickers)
+
+    if out:
+        _yahoo_note_success()
+    else:
+        # Whole batch empty → one probe, then open circuit instead of retrying every symbol.
+        try:
+            probe = download_daily_single(yahoo_tickers[0], period)
+        except YahooDataUnavailable:
+            raise
+        if probe.empty:
+            return {}
+        out[yahoo_tickers[0]] = probe
+
+    missing = [t for t in yahoo_tickers if t not in out]
+    # Cap per-batch fill-ins so a bad Yahoo day cannot stall the whole universe.
+    for idx, ticker in enumerate(missing[:3]):
+        if _yahoo_circuit_open:
+            break
+        if idx > 0:
+            time_mod.sleep(_YF_INTER_TICKER_SLEEP_SEC)
+        try:
+            frame = download_daily_single(ticker, period)
+        except YahooDataUnavailable:
+            break
+        if not frame.empty:
+            out[ticker] = frame
+    return out
 
 
 def compute_ema(close: pd.Series, period: int) -> pd.Series:
@@ -717,6 +810,8 @@ def _pick_positive(*values: object) -> Optional[float]:
 
 def fetch_live_quote(nse_symbol: str) -> Optional[LiveQuote]:
     """Latest LTP for an NSE symbol via Yahoo Finance."""
+    if _yahoo_circuit_open:
+        return None
     yahoo = to_yahoo_nse(nse_symbol)
     try:
         ticker = yf.Ticker(yahoo, **_yf_session_kwargs())
