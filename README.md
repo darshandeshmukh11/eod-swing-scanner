@@ -52,8 +52,19 @@ python eod_swing_telegram.py
 
 ## Streamlit Cloud
 
-Deploy this folder as the app root (or set **Main file path** to `eod_swing_app.py`).
+`/app/scripts/run-streamlit.sh` is **Streamlit’s own container script** (not in this repo). A
+`Segmentation fault` there usually means bad Python / native wheels (`yfinance`+`curl_cffi`,
+`pyarrow`) — not a missing file in git.
 
-**Requirements file:** `requirements.txt` (in this directory)
+**Deploy checklist**
 
-Ensure the repo includes **`eod_swing_lib.py`** alongside `eod_swing_app.py` and `eod_swing_scanner.py`.
+1. App root = this `eod-swing` folder (Main file: `eod_swing_app.py`)
+2. In Cloud → **⋮ → Settings → General → Advanced** → set **Python version = 3.11**
+3. Commit these files so Cloud rebuilds with pinned deps:
+   - `requirements.txt` (pinned)
+   - `runtime.txt` / `.python-version`
+   - `.streamlit/config.toml` (`fileWatcherType = "none"`)
+   - `eod_swing_lib.py` (Yahoo via plain `requests`, no `curl_cffi`)
+4. **Reboot app** (or delete + redeploy) so the old venv is wiped
+
+Do **not** use unpinned `streamlit` / `yfinance` on Cloud — that pulls 3.13 + curl_cffi and segfaults.
