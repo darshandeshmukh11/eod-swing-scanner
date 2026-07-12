@@ -11,11 +11,13 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, time
+from functools import lru_cache
 from typing import Optional
 from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
+import requests
 import yfinance as yf
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -23,6 +25,27 @@ NSE_MARKET_OPEN = time(9, 15)
 NSE_MARKET_CLOSE = time(15, 30)
 
 _OHLCV_COLS = ("Open", "High", "Low", "Close", "Volume")
+
+
+@lru_cache(maxsize=1)
+def _yf_session() -> requests.Session:
+    """
+    Plain requests session for Yahoo Finance.
+
+    Avoids curl_cffi (yfinance default on newer versions), which can
+    Segmentation-fault on Streamlit Community Cloud when a scan runs.
+    """
+    session = requests.Session()
+    session.headers.update(
+        {
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            )
+        }
+    )
+    return session
 
 # --- NIFTY symbol lists -------------------------------------------------------
 
@@ -244,7 +267,9 @@ def download_daily_batch(yahoo_tickers: list[str], period: str) -> dict[str, pd.
         group_by="ticker",
         auto_adjust=False,
         progress=False,
-        threads=True,
+        # threads + curl_cffi has segfaulted on Streamlit Cloud; keep single-threaded + requests
+        threads=False,
+        session=_yf_session(),
     )
     out: dict[str, pd.DataFrame] = {}
     if raw.empty:
@@ -264,7 +289,15 @@ def download_daily_batch(yahoo_tickers: list[str], period: str) -> dict[str, pd.
 
 
 def download_daily_single(yahoo_ticker: str, period: str) -> pd.DataFrame:
-    df = yf.download(yahoo_ticker, period=period, interval="1d", auto_adjust=False, progress=False)
+    df = yf.download(
+        yahoo_ticker,
+        period=period,
+        interval="1d",
+        auto_adjust=False,
+        progress=False,
+        threads=False,
+        session=_yf_session(),
+    )
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
     return _trim_ohlcv(df).dropna()
@@ -645,7 +678,7 @@ def fetch_live_quote(nse_symbol: str) -> Optional[LiveQuote]:
     """Latest LTP for an NSE symbol via Yahoo Finance."""
     yahoo = to_yahoo_nse(nse_symbol)
     try:
-        ticker = yf.Ticker(yahoo)
+        ticker = yf.Ticker(yahoo, session=_yf_session())
         price: Optional[float] = None
         day_high = 0.0
         day_low = 0.0

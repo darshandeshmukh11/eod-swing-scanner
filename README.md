@@ -54,6 +54,13 @@ python eod_swing_telegram.py
 
 Deploy this folder as the app root (or set **Main file path** to `eod_swing_app.py`).
 
-**Requirements file:** `requirements.txt` (in this directory)
+**Requirements file:** `requirements.txt` (in this directory)  
+**Python runtime:** `runtime.txt` → `python-3.11.9` (Cloud’s default 3.13 breaks yfinance / native wheels)
 
 Ensure the repo includes **`eod_swing_lib.py`** alongside `eod_swing_app.py` and `eod_swing_scanner.py`.
+
+If you see `Segmentation fault` in `/app/scripts/run-streamlit.sh` when scanning:
+
+1. Confirm `runtime.txt` and pinned `requirements.txt` are committed
+2. In Cloud: **Manage app → Reboot** (or Clear cache / redeploy)
+3. Yahoo downloads use a plain `requests` session (no `curl_cffi`) to avoid Cloud segfaults
