@@ -27,10 +27,10 @@ NSE_MARKET_OPEN = time(9, 15)
 NSE_MARKET_CLOSE = time(15, 30)
 
 _OHLCV_COLS = ("Open", "High", "Low", "Close", "Volume")
-_YF_DOWNLOAD_RETRIES = 2
-_YF_RETRY_SLEEP_SEC = 1.25
-_YF_INTER_TICKER_SLEEP_SEC = 0.2
-_YF_CIRCUIT_FAILS = 4  # consecutive empty responses → stop hammering Yahoo
+_YF_DOWNLOAD_RETRIES = 3
+_YF_RETRY_SLEEP_SEC = 2.0
+_YF_INTER_TICKER_SLEEP_SEC = 0.35
+_YF_CIRCUIT_FAILS = 6  # consecutive empty responses → stop hammering Yahoo
 
 # Yahoo returns empty bodies under rate pressure; yfinance logs that as JSONDecodeError.
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
@@ -80,15 +80,23 @@ def _yf_major_version() -> int:
         return 0
 
 
+def _yf_requires_curl_cffi() -> bool:
+    """
+    yfinance 0.2.55+ switched its transport to curl_cffi and rejects
+    plain ``requests.Session``. Older pins (e.g. 0.2.40 on Streamlit Cloud)
+    still accept a requests session with a browser User-Agent.
+    """
+    try:
+        import yfinance.data as yd
+
+        return str(getattr(yd.requests, "__name__", "")).startswith("curl_cffi")
+    except Exception:
+        return False
+
+
 @lru_cache(maxsize=1)
 def _yf_session() -> requests.Session:
-    """
-    Plain requests session for Yahoo Finance on yfinance 0.2.x.
-
-    yfinance >= 1.0 requires curl_cffi and rejects requests.Session.
-    On Streamlit Cloud, pin yfinance==0.2.40 (see requirements.txt) so this
-    path is used and curl_cffi segfaults are avoided.
-    """
+    """Plain requests session for older yfinance that still accepts it."""
     session = requests.Session()
     session.headers.update(
         {
@@ -102,8 +110,15 @@ def _yf_session() -> requests.Session:
 
 
 def _yf_session_kwargs() -> dict[str, Any]:
-    """Only inject a requests session on yfinance 0.x."""
-    if _yf_major_version() >= 1:
+    """
+    Session kwargs for yfinance calls.
+
+    When curl_cffi is required, do not inject a session — let yfinance create
+    its own chrome-impersonating curl_cffi session. Injecting requests.Session
+    raises YFDataException and every download looks like an empty/rate-limited
+    response (which trips the circuit breaker).
+    """
+    if _yf_major_version() >= 1 or _yf_requires_curl_cffi():
         return {}
     return {"session": _yf_session()}
 
@@ -292,8 +307,18 @@ def get_nifty50_and_100_universe(prefer_live: bool = True) -> tuple[list[str], s
 # --- Yahoo OHLCV download + indicators ----------------------------------------
 
 def _trim_ohlcv(frame: pd.DataFrame) -> pd.DataFrame:
+    frame = frame.copy()
     if isinstance(frame.columns, pd.MultiIndex):
-        frame.columns = frame.columns.get_level_values(-1)
+        # Prefer the level that holds OHLCV names (handles Price/Ticker layouts).
+        chosen = None
+        for level in range(frame.columns.nlevels):
+            vals = [str(v) for v in frame.columns.get_level_values(level)]
+            if set(vals) & set(_OHLCV_COLS):
+                chosen = vals
+                break
+        frame.columns = chosen if chosen is not None else [
+            str(c) for c in frame.columns.get_level_values(-1)
+        ]
     frame.columns = [str(c) for c in frame.columns]
     keep = [c for c in _OHLCV_COLS if c in frame.columns]
     if not keep:
@@ -367,8 +392,6 @@ def download_daily_single(yahoo_ticker: str, period: str) -> pd.DataFrame:
         except Exception:
             df = pd.DataFrame()
         if isinstance(df, pd.DataFrame) and not df.empty:
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
             trimmed = _trim_ohlcv(df).dropna()
             if not trimmed.empty:
                 _yahoo_note_success()
