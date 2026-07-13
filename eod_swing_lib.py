@@ -109,17 +109,28 @@ def _yf_session() -> requests.Session:
     return session
 
 
+@lru_cache(maxsize=1)
+def _yf_curl_session():
+    """Chrome-impersonating session required by modern yfinance / Yahoo."""
+    from curl_cffi import requests as curl_requests
+
+    return curl_requests.Session(impersonate="chrome")
+
+
 def _yf_session_kwargs() -> dict[str, Any]:
     """
     Session kwargs for yfinance calls.
 
-    When curl_cffi is required, do not inject a session — let yfinance create
-    its own chrome-impersonating curl_cffi session. Injecting requests.Session
-    raises YFDataException and every download looks like an empty/rate-limited
-    response (which trips the circuit breaker).
+    Never inject ``requests.Session`` into curl_cffi-based yfinance — that raises
+    YFDataException and every download looks like an empty/rate-limited response
+    (which trips the circuit breaker). Prefer an explicit curl_cffi session when
+    available; otherwise let yfinance create its own.
     """
     if _yf_major_version() >= 1 or _yf_requires_curl_cffi():
-        return {}
+        try:
+            return {"session": _yf_curl_session()}
+        except Exception:
+            return {}
     return {"session": _yf_session()}
 
 # --- NIFTY symbol lists -------------------------------------------------------
@@ -417,25 +428,31 @@ def download_daily_batch(yahoo_tickers: list[str], period: str) -> dict[str, pd.
     session_kw = _yf_session_kwargs()
     out: dict[str, pd.DataFrame] = {}
 
-    try:
-        raw = yf.download(
-            yahoo_tickers,
-            period=period,
-            interval="1d",
-            group_by="ticker",
-            auto_adjust=False,
-            progress=False,
-            threads=False,
-            **session_kw,
-        )
-    except Exception:
-        raw = pd.DataFrame()
-    out = _parse_batch_frames(raw, yahoo_tickers)
+    raw = pd.DataFrame()
+    for attempt in range(_YF_DOWNLOAD_RETRIES):
+        try:
+            raw = yf.download(
+                yahoo_tickers,
+                period=period,
+                interval="1d",
+                group_by="ticker",
+                auto_adjust=False,
+                progress=False,
+                threads=False,
+                **session_kw,
+            )
+        except Exception:
+            raw = pd.DataFrame()
+        out = _parse_batch_frames(raw, yahoo_tickers)
+        if out:
+            break
+        if attempt + 1 < _YF_DOWNLOAD_RETRIES:
+            time_mod.sleep(_YF_RETRY_SLEEP_SEC * (attempt + 1))
 
     if out:
         _yahoo_note_success()
     else:
-        # Whole batch empty → one probe, then open circuit instead of retrying every symbol.
+        # Whole batch empty → probe one ticker; only open circuit after real empties.
         try:
             probe = download_daily_single(yahoo_tickers[0], period)
         except YahooDataUnavailable:
@@ -445,8 +462,8 @@ def download_daily_batch(yahoo_tickers: list[str], period: str) -> dict[str, pd.
         out[yahoo_tickers[0]] = probe
 
     missing = [t for t in yahoo_tickers if t not in out]
-    # Cap per-batch fill-ins so a bad Yahoo day cannot stall the whole universe.
-    for idx, ticker in enumerate(missing[:3]):
+    # Fill remaining names one-by-one (gentle) so a partial Yahoo fail still scans.
+    for idx, ticker in enumerate(missing):
         if _yahoo_circuit_open:
             break
         if idx > 0:

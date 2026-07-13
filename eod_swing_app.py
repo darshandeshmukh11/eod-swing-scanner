@@ -848,25 +848,46 @@ def main() -> None:
         st.rerun()
 
     if run_clicked:
+        # Drop stale results so a previous Yahoo failure is not shown as current.
+        st.session_state.pop("eod_scan", None)
         with st.status("Downloading prices and scanning universe…", expanded=True) as scan_status:
             try:
                 result = _run_scan(cfg)
                 st.session_state["eod_scan"] = result
-                yahoo_blocked = any(
-                    "Yahoo Finance is blocking" in str(e) for e in (result.get("errors") or [])
-                )
+                errors = result.get("errors") or []
+                yahoo_blocked = any("Yahoo Finance is blocking" in str(e) for e in errors)
                 got_frames = len(result.get("frame_cache") or {})
-                if yahoo_blocked or got_frames == 0:
+                missing_n = len(result.get("missing") or [])
+                if yahoo_blocked and got_frames == 0:
                     scan_status.update(label="Yahoo blocked / no price data", state="error")
                     st.error(
-                        "Yahoo Finance returned empty responses (rate limit or Cloud IP block). "
-                        "Click **Stop**, wait ~60s, uncheck **Realtime**, then run again — "
-                        "or run locally: `python eod_swing_scanner.py --nifty50-only`."
+                        "Yahoo Finance returned empty responses (rate limit or bad session). "
+                        "**Stop the app (Ctrl+C), restart** `streamlit run eod_swing_app.py`, "
+                        "uncheck **Realtime**, wait ~30s, then Run again. "
+                        "CLI check: `python eod_swing_scanner.py --nifty50-only`."
                     )
-                    if result.get("errors"):
-                        st.caption(" · ".join(str(e) for e in result["errors"][:3]))
+                    if errors:
+                        st.caption(" · ".join(str(e) for e in errors[:3]))
+                elif got_frames == 0:
+                    scan_status.update(label="No price data downloaded", state="error")
+                    st.error(
+                        "Scan finished with 0 price frames. "
+                        "Restart Streamlit (file watcher is off, so code fixes need a restart), "
+                        "then retry with **Realtime** unchecked."
+                    )
+                    if errors:
+                        st.caption(" · ".join(str(e) for e in errors[:3]))
                 else:
-                    scan_status.update(label="Scan complete", state="complete")
+                    scan_status.update(
+                        label=f"Scan complete · {got_frames} symbols"
+                        + (f" · {missing_n} missing" if missing_n else ""),
+                        state="complete",
+                    )
+                    if yahoo_blocked:
+                        st.warning(
+                            "Yahoo rate-limited mid-scan; showing partial results. "
+                            "Wait a minute and re-run with Realtime off for a full universe."
+                        )
             except Exception as exc:
                 scan_status.update(label=f"Scan failed: {exc}", state="error")
                 st.error(str(exc))
