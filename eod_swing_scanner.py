@@ -36,7 +36,6 @@ import pandas as pd
 
 from eod_swing_lib import (
     LiveQuote,
-    YahooDataUnavailable,
     compute_adx,
     compute_ema,
     compute_macd,
@@ -44,12 +43,12 @@ from eod_swing_lib import (
     compute_supertrend,
     detect_marubozu,
     download_daily_batch,
+    download_daily_single,
     fetch_live_quotes_batch,
     get_nifty50_and_100_universe,
     get_nifty50_symbols,
     infer_support_resistance,
     merge_realtime_session,
-    reset_yahoo_circuit,
     session_bar_indices,
     supertrend_flip_bars_ago,
     to_yahoo_nse,
@@ -59,8 +58,8 @@ from eod_swing_lib import (
 @dataclass
 class ScannerConfig:
     period: str = "1y"
-    batch_size: int = 5
-    download_delay: float = 0.45
+    batch_size: int = 12
+    download_delay: float = 0.12
     prefer_live_symbols: bool = True
     min_rsi: float = 55.0
     ema_fast: int = 20
@@ -74,7 +73,7 @@ class ScannerConfig:
     breakout_buffer_pct: float = 0.15
     nifty50_only: bool = False
     use_realtime: bool = False
-    live_quote_workers: int = 3
+    live_quote_workers: int = 10
     # SuperTrend confirmation (trend filter)
     require_supertrend: bool = True
     st_atr_period: int = 10
@@ -442,7 +441,6 @@ def _scan_universe(
     frame_cache: dict[str, pd.DataFrame] = {}
 
     total_batches = max(1, (len(yahoo_tickers) + cfg.batch_size - 1) // cfg.batch_size)
-    fetch_live = cfg.use_realtime
     for batch_idx, i in enumerate(range(0, len(yahoo_tickers), cfg.batch_size)):
         batch_yahoo = yahoo_tickers[i : i + cfg.batch_size]
         batch_nse = symbols[i : i + cfg.batch_size]
@@ -450,29 +448,21 @@ def _scan_universe(
 
         try:
             frames = download_daily_batch(batch_yahoo, cfg.period)
-        except YahooDataUnavailable as exc:
-            errors.append(str(exc))
-            missing.extend(batch_nse)
-            missing.extend(symbols[i + cfg.batch_size :])
-            break
         except Exception as exc:
             errors.append(f"{batch_nse[0]}: {exc}")
             frames = {}
 
         live_quotes: dict[str, LiveQuote] = {}
-        if fetch_live:
-            try:
-                live_quotes = fetch_live_quotes_batch(
-                    batch_nse,
-                    max_workers=cfg.live_quote_workers,
-                )
-            except YahooDataUnavailable as exc:
-                errors.append(str(exc))
-                fetch_live = False
+        if cfg.use_realtime:
+            live_quotes = fetch_live_quotes_batch(
+                batch_nse,
+                max_workers=cfg.live_quote_workers,
+            )
 
         for nse_symbol, yahoo_ticker in zip(batch_nse, batch_yahoo):
             frame = frames.get(yahoo_ticker)
-            # Batch helper already probed missing names; do not re-hammer Yahoo here.
+            if frame is None or frame.empty:
+                frame = download_daily_single(yahoo_ticker, cfg.period)
             if frame is None or frame.empty:
                 missing.append(nse_symbol)
                 continue
@@ -503,7 +493,6 @@ def run_eod_swing_scan(
     cfg: Optional[ScannerConfig] = None,
 ) -> tuple[list[ScanHit], str, list[str], list[str], dict[str, pd.DataFrame], set[str]]:
     cfg = cfg or ScannerConfig()
-    reset_yahoo_circuit()
 
     mode = "Realtime (live LTP)" if cfg.use_realtime else "EOD (last completed session)"
     print("EOD swing scanner")
@@ -652,7 +641,7 @@ def parse_args() -> argparse.Namespace:
         help="Use live LTP on today's session bar (default: last completed EOD bar)",
     )
     p.add_argument("-o", "--output", help="Write CSV path")
-    p.add_argument("--delay", type=float, default=0.45)
+    p.add_argument("--delay", type=float, default=0.12)
     return p.parse_args()
 
 

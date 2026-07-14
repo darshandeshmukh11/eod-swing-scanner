@@ -8,18 +8,14 @@ modules required at import time.
 
 from __future__ import annotations
 
-import logging
-import time as time_mod
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, time
-from functools import lru_cache
-from typing import Any, Optional
+from typing import Optional
 from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
-import requests
 import yfinance as yf
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -27,111 +23,6 @@ NSE_MARKET_OPEN = time(9, 15)
 NSE_MARKET_CLOSE = time(15, 30)
 
 _OHLCV_COLS = ("Open", "High", "Low", "Close", "Volume")
-_YF_DOWNLOAD_RETRIES = 3
-_YF_RETRY_SLEEP_SEC = 2.0
-_YF_INTER_TICKER_SLEEP_SEC = 0.35
-_YF_CIRCUIT_FAILS = 6  # consecutive empty responses → stop hammering Yahoo
-
-# Yahoo returns empty bodies under rate pressure; yfinance logs that as JSONDecodeError.
-logging.getLogger("yfinance").setLevel(logging.CRITICAL)
-
-
-class YahooDataUnavailable(RuntimeError):
-    """Raised when Yahoo Finance is blocked / rate-limited for this environment."""
-
-
-# Process-wide circuit: once tripped, skip further Yahoo calls until process restart.
-_yahoo_circuit_open = False
-_yahoo_consecutive_fails = 0
-
-
-def _yahoo_note_success() -> None:
-    global _yahoo_consecutive_fails
-    _yahoo_consecutive_fails = 0
-
-
-def _yahoo_note_failure() -> None:
-    global _yahoo_circuit_open, _yahoo_consecutive_fails
-    _yahoo_consecutive_fails += 1
-    if _yahoo_consecutive_fails >= _YF_CIRCUIT_FAILS:
-        _yahoo_circuit_open = True
-
-
-def reset_yahoo_circuit() -> None:
-    """Clear the Yahoo fail-fast latch (call at the start of a new scan)."""
-    global _yahoo_circuit_open, _yahoo_consecutive_fails
-    _yahoo_circuit_open = False
-    _yahoo_consecutive_fails = 0
-
-
-def _ensure_yahoo_circuit_closed() -> None:
-    if _yahoo_circuit_open:
-        raise YahooDataUnavailable(
-            "Yahoo Finance is blocking or rate-limiting this environment "
-            "(empty JSON responses). Stop the run, wait a minute, then retry "
-            "with Realtime OFF — or run the scanner locally instead of Streamlit Cloud."
-        )
-
-
-def _yf_major_version() -> int:
-    try:
-        return int(str(getattr(yf, "__version__", "0")).split(".")[0])
-    except (TypeError, ValueError):
-        return 0
-
-
-def _yf_requires_curl_cffi() -> bool:
-    """
-    yfinance 0.2.55+ switched its transport to curl_cffi and rejects
-    plain ``requests.Session``. Older pins (e.g. 0.2.40 on Streamlit Cloud)
-    still accept a requests session with a browser User-Agent.
-    """
-    try:
-        import yfinance.data as yd
-
-        return str(getattr(yd.requests, "__name__", "")).startswith("curl_cffi")
-    except Exception:
-        return False
-
-
-@lru_cache(maxsize=1)
-def _yf_session() -> requests.Session:
-    """Plain requests session for older yfinance that still accepts it."""
-    session = requests.Session()
-    session.headers.update(
-        {
-            "User-Agent": (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-            )
-        }
-    )
-    return session
-
-
-@lru_cache(maxsize=1)
-def _yf_curl_session():
-    """Chrome-impersonating session required by modern yfinance / Yahoo."""
-    from curl_cffi import requests as curl_requests
-
-    return curl_requests.Session(impersonate="chrome")
-
-
-def _yf_session_kwargs() -> dict[str, Any]:
-    """
-    Session kwargs for yfinance calls.
-
-    Never inject ``requests.Session`` into curl_cffi-based yfinance — that raises
-    YFDataException and every download looks like an empty/rate-limited response
-    (which trips the circuit breaker). Prefer an explicit curl_cffi session when
-    available; otherwise let yfinance create its own.
-    """
-    if _yf_major_version() >= 1 or _yf_requires_curl_cffi():
-        try:
-            return {"session": _yf_curl_session()}
-        except Exception:
-            return {}
-    return {"session": _yf_session()}
 
 # --- NIFTY symbol lists -------------------------------------------------------
 
@@ -318,18 +209,8 @@ def get_nifty50_and_100_universe(prefer_live: bool = True) -> tuple[list[str], s
 # --- Yahoo OHLCV download + indicators ----------------------------------------
 
 def _trim_ohlcv(frame: pd.DataFrame) -> pd.DataFrame:
-    frame = frame.copy()
     if isinstance(frame.columns, pd.MultiIndex):
-        # Prefer the level that holds OHLCV names (handles Price/Ticker layouts).
-        chosen = None
-        for level in range(frame.columns.nlevels):
-            vals = [str(v) for v in frame.columns.get_level_values(level)]
-            if set(vals) & set(_OHLCV_COLS):
-                chosen = vals
-                break
-        frame.columns = chosen if chosen is not None else [
-            str(c) for c in frame.columns.get_level_values(-1)
-        ]
+        frame.columns = frame.columns.get_level_values(-1)
     frame.columns = [str(c) for c in frame.columns]
     keep = [c for c in _OHLCV_COLS if c in frame.columns]
     if not keep:
@@ -353,9 +234,20 @@ def _extract_ticker_frame(data: pd.DataFrame, ticker: str) -> pd.DataFrame:
     return pd.DataFrame()
 
 
-def _parse_batch_frames(raw: pd.DataFrame, yahoo_tickers: list[str]) -> dict[str, pd.DataFrame]:
+def download_daily_batch(yahoo_tickers: list[str], period: str) -> dict[str, pd.DataFrame]:
+    if not yahoo_tickers:
+        return {}
+    raw = yf.download(
+        yahoo_tickers,
+        period=period,
+        interval="1d",
+        group_by="ticker",
+        auto_adjust=False,
+        progress=False,
+        threads=True,
+    )
     out: dict[str, pd.DataFrame] = {}
-    if raw is None or raw.empty:
+    if raw.empty:
         return out
     if len(yahoo_tickers) == 1:
         frame = _extract_ticker_frame(raw, yahoo_tickers[0])
@@ -371,110 +263,11 @@ def _parse_batch_frames(raw: pd.DataFrame, yahoo_tickers: list[str]) -> dict[str
     return out
 
 
-def _history_fallback(yahoo_ticker: str, period: str) -> pd.DataFrame:
-    """Fallback when multi-ticker download returns empty JSON under rate limits."""
-    try:
-        hist = yf.Ticker(yahoo_ticker, **_yf_session_kwargs()).history(
-            period=period,
-            interval="1d",
-            auto_adjust=False,
-        )
-    except Exception:
-        return pd.DataFrame()
-    if hist is None or hist.empty:
-        return pd.DataFrame()
-    return _trim_ohlcv(hist).dropna()
-
-
 def download_daily_single(yahoo_ticker: str, period: str) -> pd.DataFrame:
-    _ensure_yahoo_circuit_closed()
-    session_kw = _yf_session_kwargs()
-    for attempt in range(_YF_DOWNLOAD_RETRIES):
-        try:
-            df = yf.download(
-                yahoo_ticker,
-                period=period,
-                interval="1d",
-                auto_adjust=False,
-                progress=False,
-                threads=False,
-                **session_kw,
-            )
-        except Exception:
-            df = pd.DataFrame()
-        if isinstance(df, pd.DataFrame) and not df.empty:
-            trimmed = _trim_ohlcv(df).dropna()
-            if not trimmed.empty:
-                _yahoo_note_success()
-                return trimmed
-
-        fallback = _history_fallback(yahoo_ticker, period)
-        if not fallback.empty:
-            _yahoo_note_success()
-            return fallback
-
-        if attempt + 1 < _YF_DOWNLOAD_RETRIES:
-            time_mod.sleep(_YF_RETRY_SLEEP_SEC * (attempt + 1))
-
-    _yahoo_note_failure()
-    _ensure_yahoo_circuit_closed()
-    return pd.DataFrame()
-
-
-def download_daily_batch(yahoo_tickers: list[str], period: str) -> dict[str, pd.DataFrame]:
-    if not yahoo_tickers:
-        return {}
-    _ensure_yahoo_circuit_closed()
-    session_kw = _yf_session_kwargs()
-    out: dict[str, pd.DataFrame] = {}
-
-    raw = pd.DataFrame()
-    for attempt in range(_YF_DOWNLOAD_RETRIES):
-        try:
-            raw = yf.download(
-                yahoo_tickers,
-                period=period,
-                interval="1d",
-                group_by="ticker",
-                auto_adjust=False,
-                progress=False,
-                threads=False,
-                **session_kw,
-            )
-        except Exception:
-            raw = pd.DataFrame()
-        out = _parse_batch_frames(raw, yahoo_tickers)
-        if out:
-            break
-        if attempt + 1 < _YF_DOWNLOAD_RETRIES:
-            time_mod.sleep(_YF_RETRY_SLEEP_SEC * (attempt + 1))
-
-    if out:
-        _yahoo_note_success()
-    else:
-        # Whole batch empty → probe one ticker; only open circuit after real empties.
-        try:
-            probe = download_daily_single(yahoo_tickers[0], period)
-        except YahooDataUnavailable:
-            raise
-        if probe.empty:
-            return {}
-        out[yahoo_tickers[0]] = probe
-
-    missing = [t for t in yahoo_tickers if t not in out]
-    # Fill remaining names one-by-one (gentle) so a partial Yahoo fail still scans.
-    for idx, ticker in enumerate(missing):
-        if _yahoo_circuit_open:
-            break
-        if idx > 0:
-            time_mod.sleep(_YF_INTER_TICKER_SLEEP_SEC)
-        try:
-            frame = download_daily_single(ticker, period)
-        except YahooDataUnavailable:
-            break
-        if not frame.empty:
-            out[ticker] = frame
-    return out
+    df = yf.download(yahoo_ticker, period=period, interval="1d", auto_adjust=False, progress=False)
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    return _trim_ohlcv(df).dropna()
 
 
 def compute_ema(close: pd.Series, period: int) -> pd.Series:
@@ -850,11 +643,9 @@ def _pick_positive(*values: object) -> Optional[float]:
 
 def fetch_live_quote(nse_symbol: str) -> Optional[LiveQuote]:
     """Latest LTP for an NSE symbol via Yahoo Finance."""
-    if _yahoo_circuit_open:
-        return None
     yahoo = to_yahoo_nse(nse_symbol)
     try:
-        ticker = yf.Ticker(yahoo, **_yf_session_kwargs())
+        ticker = yf.Ticker(yahoo)
         price: Optional[float] = None
         day_high = 0.0
         day_low = 0.0
